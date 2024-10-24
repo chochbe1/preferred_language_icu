@@ -447,15 +447,10 @@ patient_assessments <- fread("/share/projects/data/circe/v20240331/clif/patient_
                              select = c("hospitalization_id", "recorded_dttm", "assessment_category", 
                                         "assessment_group", "numerical_value", "categorical_value", "text_value"))[hospitalization_id %in% hosp_time_clean_id]
 
-patient_assessments %>% distinct(hospitalization_id)
-
 
 # STEP 2: Form RASS Specific Patient Assessment Table
 pat_assess_rass <- patient_assessments[assessment_category == "RASS"]
 setorder(pat_assess_rass, hospitalization_id, recorded_dttm)
-
-
-pat_assess_rass %>% distinct(hospitalization_id)
 
 
 # STEP 3: Identify first RASS Timepoint
@@ -499,16 +494,13 @@ labs <- fread(paste0(data_dir,"labs.csv.gz"), select = c("hospitalization_id", "
 setorder(labs, hospitalization_id, lab_collect_dttm)
 setnames(labs, "lab_collect_dttm", "recorded_dttm")
 
-
 # STEP 3: Upload CLIF Continuous Meds
 meds <- fread(paste0(data_dir,"medication_admin_continuous.csv.gz"))[hospitalization_id %in% hosp_id_vitals_clean]
 
-labs %>% distinct(hospitalization_id)
 
 # STEP 4: Establish the timeline
 # Develop Specific Time Range to Pull Data From
 hosp_clean_time <- hosp_rass_clean[, .(hospitalization_id, begin_imv, end_imv, total_imv_time)][hospitalization_id %in% hosp_id_vitals_clean]
-
 
 
 # Expand table to create 1-hour increments from admission_dttm to discharge_dttm for all hospitalization_ids
@@ -539,7 +531,7 @@ earliest_paralytics <- meds_paralytics[, .(earliest_paralytic_dttm = min(admin_d
 
 
 # STEP 4: Merge with hosp_rass_clean
-paralytic_clean <- merge(hosp_rass_clean, earliest_paralytics, by = "hospitalization_id", all.x = TRUE)
+paralytic_clean <- merge(hosp_clean_time, earliest_paralytics, by = "hospitalization_id", all.x = TRUE)
 
 
 # STEP 5: Identify patients paralyzed within first 48 hours after beginning mechanical ventilation
