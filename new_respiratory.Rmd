@@ -1,0 +1,749 @@
+```{r}
+
+# Define the Directory
+data_dir <- "/share/projects/data/circe/v20240331/clif/" # Add your directory information here
+
+
+# Install Packages
+
+packages <- c("zoo", "data.table")
+install_if_missing <- function(package) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package, dependencies = TRUE)
+    library(package, character.only = TRUE)
+  }
+}
+ 
+sapply(packages, install_if_missing)
+
+# Load necessary libraries
+library(data.table)
+library(zoo)  # for na.locf function
+
+# Load Raw CLIF respiratory_support table
+respiratory_support <- fread(paste0(data_dir, "respiratory_support.csv.gz"), select = c("hospitalization_id", "recorded_dttm", "device_category", "tracheostomy"))
+
+
+# Identify hospitalization_ids that have tracheostomy at some point during their hospitalization
+trach_resp <- respiratory_support[tracheostomy == "TRUE"] # Will need to change TRUE to 1
+hosp_id_trach <- unique(trach_resp$hospitalization_id)
+
+# Identify hospital_ids that have "trach collar" device at any point in hospitalization
+trach_collar_resp <- respiratory_support[device_category == "Trach Collar"]
+hosp_id_trach_collar <- unique(trach_collar_resp$hospitalization_id)
+
+# Merge the Two Trach Hospital ID Tables
+total_trach_id <- union(hosp_id_trach, hosp_id_trach_collar)
+
+resp_supp_trach <- respiratory_support[hospitalization_id %in% total_trach_id]
+setorder(resp_supp_trach, hospitalization_id, recorded_dttm)
+
+# Load in Patient and Hospitalization Merge it with Hospitalization_ID
+# Upload Limited Hospitalization and Patient Tables
+hospitalization_limit <- fread(paste0(data_dir,"hospitalization.csv.gz"), select = c("patient_id", "hospitalization_id"))[hospitalization_id %in% total_trach_id]
+hospitalization_limit <- unique(hospitalization_limit, by = "hospitalization_id")
+
+patient_id_limit <- unique(hospitalization_limit$patient_id)
+patient_limit <- fread(paste0(data_dir,"patient.csv.gz"), select = c("patient_id"))[patient_id %in% patient_id_limit]
+
+# Merge Hospitalization and Patient Across Patient_ID
+pat_hosp_limit <- merge(hospitalization_limit, patient_limit, by = "patient_id", all.x = TRUE)
+setorder(pat_hosp_limit, patient_id)
+
+# Merge pat_hosp with resp_supp_trach
+pat_resp_trach <- merge(pat_hosp_limit, resp_supp_trach, by = "hospitalization_id", all.x = TRUE)
+
+# Convert any blank values in device_category to "NA" and then perform LOCF to fill device_category column
+pat_resp_trach[device_category == "", device_category := NA]
+pat_resp_trach[, device_category := na.locf(device_category, na.rm = FALSE), by = hospitalization_id]
+
+# Identify the first timestamp where the tracheostomy value is "TRUE" for each hospitalization_id
+trach_true <- pat_resp_trach[tracheostomy == "TRUE"]
+trach_dttm_table <- trach_true[, .(trach_dttm = min(recorded_dttm)), by = hospitalization_id]
+
+# Identify the first timestamp where trach collar is documented for each hospitalization_id
+trach_collar_true <- pat_resp_trach[device_category == "Trach Collar"]
+trach_collar_dttm_table <- trach_collar_true[, .(trach_collar_dtm = min(recorded_dttm)), by = hospitalization_id]
+
+# Merge Trach and Trach Collar Time Tables
+trach_times <- merge(trach_dttm_table, trach_collar_dttm_table, by = "hospitalization_id", , all = TRUE)
+
+# Merge pat_resp_trach with trach_times
+pat_resp_trach_times <- merge(pat_resp_trach, trach_times, by = "hospitalization_id", all.x = TRUE)
+pat_resp_trach_times[, first_trach_dttm := pmin(trach_dttm, trach_collar_dtm, na.rm = TRUE)]
+setorder(pat_resp_trach_times, patient_id, first_trach_dttm)
+
+# Table of patient_id and earliest trach times
+earliest_trach <- pat_resp_trach_times[, .SD[which.min(first_trach_dttm)], by = patient_id]
+earliest_trach <- earliest_trach[, .(patient_id, first_trach_dttm)]
+
+# Merge Along Patient ID for Earliest Trach
+earliest_trach_total <- merge(pat_resp_trach, earliest_trach, by = "patient_id", all.x = TRUE)
+earliest_trach_total <- earliest_trach_total[, .(hospitalization_id, recorded_dttm, first_trach_dttm, device_category)]
+
+early_trach_id <- earliest_trach_total %>% distinct(hospitalization_id)
+
+
+# Filter for Only Hospitalization_IDs in Earliest Trach Total with "IMV"
+filtered_resp <- respiratory_support[device_category == "IMV"]
+hosp_id_imv <- unique(filtered_resp$hospitalization_id)
+
+earliest_trach_imv <- earliest_trach_total[hospitalization_id %in% hosp_id_imv]
+
+# Filter out rows where recorded_dttm is before trach_dttm and return table to original columns
+pre_trach_imv <- earliest_trach_imv[recorded_dttm < first_trach_dttm]
+pre_trach_filter <- pre_trach_imv[device_category == "IMV"]
+hosp_id_pre_trach <- unique(pre_trach_filter$hospitalization_id)
+
+
+```
+
+```{R}
+# PART TWO LETS TRY AGAIN 
+
+# STEP ONE: Establish working data table
+hosp_id_no_trach <- setdiff(hosp_id_imv, total_trach_id)
+resp_supp_no_trach <- respiratory_support[hospitalization_id %in% hosp_id_no_trach]
+respiratory_support_imv <- rbind(pre_trach_filter, resp_supp_no_trach, use.names = TRUE, fill = TRUE)
+respiratory_support_imv <- respiratory_support_imv[, .(hospitalization_id, recorded_dttm, first_trach_dttm, device_category)]
+setorder(respiratory_support_imv, hospitalization_id, recorded_dttm)
+
+
+# STEP TWO: Convert any blank values in device_category to "NA" and then perform LOCF to fill device_category column
+respiratory_support_imv[device_category == "", device_category := NA]
+respiratory_support_imv[, device_category := na.locf(device_category, na.rm = FALSE), by = hospitalization_id]
+
+
+# STEP THREE: Use rleid to create unique IDs for each run of "IMV" in the device_category
+respiratory_support_imv[, imv_run_id := rleid(device_category == "IMV"), by = hospitalization_id]
+
+
+# STEP FIVE: For each imv_run_id, calculate the beginning and end of each IMV run
+# Incorporating the logic for finding the next row's recorded_dttm to set the end time properly
+imv_runs_aggregated <- respiratory_support_imv[device_category == "IMV", .(
+  begin_imv = first(recorded_dttm),  # Start time of the IMV run
+  end_imv = {
+    # Find the next recorded_dttm, regardless of whether it's IMV or not
+    next_recorded_dttm <- shift(recorded_dttm, type = "lead")
+    fifelse(!is.na(next_recorded_dttm), next_recorded_dttm, last(recorded_dttm))  # Use next row's time or last IMV timestamp
+  }
+), by = .(hospitalization_id, imv_run_id)]
+
+
+imv_runs_aggregated %>% distinct(hospitalization_id)
+
+# STEP SIX: Identify gaps less than 12 hours between consecutive IMV runs using shift command then create a column to identify presence of gap
+imv_runs_aggregated[, next_begin_imv := shift(begin_imv, type = "lead"), by = hospitalization_id]
+imv_runs_aggregated[, time_diff_hours := difftime(next_begin_imv, end_imv, units = "hours"), by = hospitalization_id]
+imv_runs_aggregated[, combine_run := (time_diff_hours < 12), by = hospitalization_id]
+
+# STEP SEVEN: Ensure proper combination by handling forward and backward combine flags using shift command
+imv_runs_aggregated[, next_combine := shift(combine_run, type = "lead", fill = FALSE), by = hospitalization_id]
+imv_runs_aggregated[, prev_combine := shift(combine_run, type = "lag", fill = FALSE), by = hospitalization_id]
+
+# STEP EIGHT: Create a combined_run_id ensuring it does not group runs where combine_run is FALSE
+# The ID should increment if combine_run is FALSE and not dependent on neighbors' combine flags.
+imv_runs_aggregated[, combined_run_id := rleid(!(combine_run | prev_combine)), by = hospitalization_id]
+
+# STEP NINE: Aggregate runs based on the combined_run_id for each hospitalization_id
+final_imv_runs <- imv_runs_aggregated[, .(
+  begin_imv = min(begin_imv),  # Earliest begin time for the combined run
+  end_imv = max(end_imv)       # Latest end time for the combined run
+), by = .(hospitalization_id, combined_run_id)]
+
+# STEP TEN: Determine total time of each IMV run
+final_imv_runs[, total_imv_time := as.numeric(difftime(end_imv, begin_imv, units = "hours"))]
+
+# STEP ELEVEN: Only Retain the first IMV Run for each hospitalization_id
+final_imv_runs <- final_imv_runs[, .SD[1], by = hospitalization_id]
+
+# STEP TWELVE: Filter rows where total_imv_time is greater than or equal to 24 hours
+final_imv_runs_filtered <- final_imv_runs[total_imv_time >= 24]
+final_imv_runs_filtered <- final_imv_runs_filtered[, .(hospitalization_id, begin_imv, end_imv, total_imv_time)]
+
+# Hospital IDs in the IMV Runs:
+hosp_id_imv_runs <- unique(final_imv_runs_filtered$hospitalization_id)
+
+
+```
+
+# PART THREE: ESTABLISH THE TIMELINE
+```{R}
+## Upload Limited Hospitalization and Patient Tables
+hospitalization_time <- fread(paste0(data_dir,"hospitalization.csv.gz"), select = c("patient_id", "hospitalization_id", "admission_dttm", "discharge_dttm", "discharge_name", "discharge_category"))[hospitalization_id %in% hosp_id_imv_runs]
+hospitalization_time <- unique(hospitalization_time, by = "hospitalization_id")
+
+patient_id_time <- unique(hospitalization_time$patient_id)
+patient_time <- fread(paste0(data_dir,"patient.csv.gz"), select = c("patient_id",  "death_dttm"))[patient_id %in% patient_id_time]
+
+# Merge Hospitalization and Patient Across Patient_ID
+pat_hosp <- merge(hospitalization_time, patient_time, by = "patient_id", all.x = TRUE)
+setorder(pat_hosp, patient_id, admission_dttm)
+
+# Merge with Early Trach DTTM Table
+hosp_timeline <- merge(pat_hosp, earliest_trach, by = "patient_id", all.x = TRUE)
+
+# Merge with IMV Times 
+hosp_timeline <- merge(hosp_timeline, final_imv_runs_filtered, by = "hospitalization_id", all.x = TRUE)
+hosp_timeline <- hosp_timeline[, .(patient_id, hospitalization_id, admission_dttm, discharge_dttm, begin_imv, end_imv, first_trach_dttm, death_dttm, total_imv_time, discharge_name, discharge_category)]
+setorder(hosp_timeline, patient_id, admission_dttm)
+
+# Was patient intubated at time of discharge?
+hosp_timeline[, intubated_at_discharge := ifelse(difftime(discharge_dttm, end_imv, units = "hours") <= 2, TRUE, FALSE)]
+
+
+# Filter the rows where first_trach_dttm is after discharge_dttm
+trach_after_discharge <- pat_hosp_time[first_trach_dttm > discharge_dttm]
+
+# View the result
+trach_after_discharge
+
+
+
+
+# Identify Intra-Hospital System Transfers
+pat_hosp[, next_admission_dttm := shift(admission_dttm, type = "lead"), by = patient_id]
+pat_hosp[, time_diff_hours := difftime(next_admission_dttm, discharge_dttm, units = "hours"), by = patient_id]
+setorder(pat_hosp, patient_id, admission_dttm)
+pat_hosp[, transfer_flag := ifelse(discharge_category == "Acute Care Hospital" & time_diff_hours < 24, "Transfer Out", "")]
+
+# Identify the next hospitalization as "Transfer In" if the previous was "Transfer Out"
+# Shift the "Transfer Out" flag to the next row within the same patient_id
+pat_hosp[, next_transfer_out_flag := shift(transfer_flag == "Transfer Out", type = "lag"), by = patient_id]
+
+# If the next_transfer_out_flag is TRUE, flag the current row as "Transfer In"
+pat_hosp[, transfer_flag := ifelse(next_transfer_out_flag == TRUE & transfer_flag == "", "Transfer In", transfer_flag)]
+
+
+# Attach Total IMV Run Time To Pat_Hosp Table
+total_imv_runs <- final_imv_runs_filtered[, .(hospitalization_id, total_imv_time)]
+pat_hosp_imv <- merge(pat_hosp, total_imv_runs, by = "hospitalization_id", all.x = TRUE)
+setorder(pat_hosp_imv, patient_id, admission_dttm)
+pat_hosp_imv[, drop_transfer := ifelse(transfer_flag == "Transfer" & total_imv_time > 72, "Drop Next Row", "")]
+pat_hosp_imv <- pat_hosp_imv[, .(patient_id, hospitalization_id, admission_dttm, discharge_dttm, transfer_flag, drop_transfer)]
+setorder(pat_hosp_imv, patient_id, admission_dttm)
+
+
+intra_hospital_transfers <- pat_hosp[time_diff_hours < 24, .(patient_id, hospitalization_id, next_admission_dttm)]
+
+
+
+```
+
+```{R}
+# Determine all hospitalization_ids associated that have at least one device_category of "IMV" and filter respiratory_support to only keep these hospitalization_ids
+filtered_resp <- respiratory_support[device_category == "IMV"]
+hosp_id_imv <- unique(filtered_resp$hospitalization_id)
+respiratory_support <- respiratory_support[hospitalization_id %in% hosp_id_imv]
+
+
+# ***** PART ONE: Process the tracheostomy patients to remove any data after they have been trached *****
+
+# Upload Limited Hospitalization and Patient Tables
+hospitalization_imv <- fread(paste0(data_dir,"hospitalization.csv.gz"), select = c("patient_id", "hospitalization_id"))[hospitalization_id %in% hosp_id_imv]
+hospitalization_imv <- unique(hospitalization_imv, by = "hospitalization_id")
+
+patient_id_imv <- unique(hospitalization_imv$patient_id)
+patient_imv <- fread(paste0(data_dir,"patient.csv.gz"), select = c("patient_id"))[patient_id %in% patient_id_imv]
+
+# Merge Hospitalization and Patient Across Patient_ID
+pat_hosp_imv <- merge(hospitalization_imv, patient_imv, by = "patient_id", all.x = TRUE)
+setorder(pat_hosp_limit, patient_id)
+
+# Merge with Earliest Trach Data Across patient_id
+imv_trach_merge <- merge(pat_hosp_imv, earliest_trach, by = "patient_id", all.x = TRUE)
+
+# Merge with Respiratory Table
+resp_imv <- merge(imv_trach_merge, respiratory_support, by = "hospitalization_id", all.x = TRUE)
+resp_imv <- resp_imv[, .(hospitalization_id, first_trach_dttm, recorded_dttm, device_category)]
+
+# Convert any blank values in device_category to "NA" and then perform LOCF to fill device_category column
+resp_imv[device_category == "", device_category := NA]
+resp_imv[, device_category := na.locf(device_category, na.rm = FALSE), by = hospitalization_id]
+
+# Filter out rows where recorded_dttm is before trach_dttm and return table to original columns
+resp_imv <- resp_imv[recorded_dttm < first_trach_dttm]
+setorder(resp_imv, hospitalization_id, recorded_dttm)
+
+
+```
+
+```{R}
+# NEW PART TWO: LET'S PRAY!
+
+# STEP THREE: Use rleid to create unique IDs for each run of "IMV" in the device_category
+resp_imv[, imv_run_id := rleid(device_category == "IMV"), by = hospitalization_id]
+
+# STEP FIVE: For each imv_run_id, calculate the beginning and end of each IMV run
+# Incorporating the logic for finding the next row's recorded_dttm to set the end time properly
+imv_runs_aggregated <- resp_imv[device_category == "IMV", .(
+  begin_imv = first(recorded_dttm),  # Start time of the IMV run
+  end_imv = {
+    # Find the next recorded_dttm, regardless of whether it's IMV or not
+    next_recorded_dttm <- shift(recorded_dttm, type = "lead")
+    fifelse(!is.na(next_recorded_dttm), next_recorded_dttm, last(recorded_dttm))  # Use next row's time or last IMV timestamp
+  }
+), by = .(hospitalization_id, imv_run_id)]
+
+# STEP SIX: Identify gaps less than 24 hours between consecutive IMV runs using shift command then create a column to identify presence of gap
+imv_runs_aggregated[, next_begin_imv := shift(begin_imv, type = "lead"), by = hospitalization_id]
+imv_runs_aggregated[, time_diff_hours := difftime(next_begin_imv, end_imv, units = "hours"), by = hospitalization_id]
+imv_runs_aggregated[, combine_run := (time_diff_hours < 24), by = hospitalization_id]
+
+# STEP SEVEN: Ensure proper combination by handling forward and backward combine flags using shift command
+imv_runs_aggregated[, next_combine := shift(combine_run, type = "lead", fill = FALSE), by = hospitalization_id]
+imv_runs_aggregated[, prev_combine := shift(combine_run, type = "lag", fill = FALSE), by = hospitalization_id]
+
+# STEP EIGHT: Create a combined_run_id ensuring it does not group runs where combine_run is FALSE
+# The ID should increment if combine_run is FALSE and not dependent on neighbors' combine flags.
+imv_runs_aggregated[, combined_run_id := rleid(!(combine_run | prev_combine)), by = hospitalization_id]
+
+# STEP NINE: Aggregate runs based on the combined_run_id for each hospitalization_id
+final_imv_runs <- imv_runs_aggregated[, .(
+  begin_imv = min(begin_imv),  # Earliest begin time for the combined run
+  end_imv = max(end_imv)       # Latest end time for the combined run
+), by = .(hospitalization_id, combined_run_id)]
+
+# STEP TEN: Determine total time of each IMV run
+final_imv_runs[, total_imv_time := as.numeric(difftime(end_imv, begin_imv, units = "hours"))]
+
+# STEP ELEVEN: Only Retain the first IMV Run for each hospitalization_id
+final_imv_runs <- final_imv_runs[, .SD[1], by = hospitalization_id]
+setorder(final_imv_runs, hospitalization_id, begin_imv)
+
+# STEP TWELVE: Filter rows where total_imv_time is greater than or equal to 24 hours
+final_imv_runs_filtered <- final_imv_runs[total_imv_time >= 24]
+final_imv_runs_filtered <- final_imv_runs_filtered[, .(hospitalization_id, begin_imv, end_imv, total_imv_time)]
+
+# Hospital IDs in the IMV Runs:
+hosp_id_imv_runs <- unique(final_imv_runs_filtered$hospitalization_id)
+
+# Trach Times with IMV Runs
+imv_trach_times <- trach_times[hospitalization_id %in% hosp_id_imv_runs]
+imv_trach_times <- imv_trach_times[, .(hospitalization_id, first_trach_dttm)]
+
+# Combined IMV and Trach Times Table
+imv_times_final <- merge(final_imv_runs_filtered, imv_trach_times, by = "hospitalization_id", , all = TRUE)
+
+```
+
+```{R}
+
+
+# Identify hospitalization_ids that have both IMV and tracheostomy at some point during their hospitalization
+trach_resp <- respiratory_support[tracheostomy == "TRUE"] # Will need to change TRUE to 1
+hosp_id_trach <- unique(trach_resp$hospitalization_id)
+
+# Identify hospital_ids that have "trach collar" device at any point in hospitalization
+trach_collar_resp <- respiratory_support[device_category == "Trach Collar"]
+hosp_id_trach_collar <- unique(trach_collar_resp$hospitalization_id)
+
+# Merge the Two Trach Hospital ID Tables
+total_trach_id <- union(hosp_id_trach, hosp_id_trach_collar)
+
+resp_supp_trach <- respiratory_support[hospitalization_id %in% total_trach_id]
+setorder(resp_supp_trach, hospitalization_id, recorded_dttm)
+
+# Convert any blank values in device_category to "NA" and then perform LOCF to fill device_category column
+resp_supp_trach[device_category == "", device_category := NA]
+resp_supp_trach[, device_category := na.locf(device_category, na.rm = FALSE), by = hospitalization_id]
+
+# Identify the first timestamp where the tracheostomy value is "TRUE" for each hospitalization_id
+trach_true <- resp_supp_trach[tracheostomy == "TRUE"]
+trach_dttm_table <- trach_true[, .(trach_dttm = min(recorded_dttm)), by = hospitalization_id]
+
+# Identify the first timestamp where trach collar is documented for each hospitalization_id
+trach_collar_true <- resp_supp_trach[device_category == "Trach Collar"]
+trach_collar_dttm_table <- trach_collar_true[, .(trach_collar_dtm = min(recorded_dttm)), by = hospitalization_id]
+
+# Merge Trach and Trach Collar Time Tables then choose earliest dttm
+trach_times <- merge(trach_dttm_table, trach_collar_dttm_table, by = "hospitalization_id", , all = TRUE)
+trach_times[, first_trach_dttm := pmin(trach_dttm, trach_collar_dtm, na.rm = TRUE)]
+
+# Merge trach_times with resp_supp_trach to compare recorded_dttm by performing a join on hospitalization_id
+resp_supp_pre_trach <- merge(resp_supp_trach, trach_times, by = "hospitalization_id", all.x = TRUE)
+resp_supp_pre_trach <- resp_supp_pre_trach[, .(hospitalization_id, recorded_dttm, device_category, first_trach_dttm)]
+
+# Filter out rows where recorded_dttm is before trach_dttm and return table to original columns
+resp_supp_pre_trach <- resp_supp_pre_trach[recorded_dttm < first_trach_dttm]
+
+# *********** PART TWO: Establish the time periods of IMV *************
+
+# STEP ONE: Establish working data table
+hosp_id_no_trach <- setdiff(hosp_id_imv, total_trach_id)
+resp_supp_no_trach <- respiratory_support[hospitalization_id %in% hosp_id_no_trach]
+respiratory_support_imv <- rbind(resp_supp_pre_trach, resp_supp_no_trach, use.names = TRUE, fill = TRUE)
+respiratory_support_imv <- respiratory_support_imv[, .(hospitalization_id, recorded_dttm, device_category, first_trach_dttm)]
+setorder(respiratory_support_imv, hospitalization_id, recorded_dttm)
+
+
+# STEP TWO: Convert any blank values in device_category to "NA" and then perform LOCF to fill device_category column
+respiratory_support_imv[device_category == "", device_category := NA]
+respiratory_support_imv[, device_category := na.locf(device_category, na.rm = FALSE), by = hospitalization_id]
+
+# STEP THREE: Use rleid to create unique IDs for each run of "IMV" in the device_category
+respiratory_support_imv[, imv_run_id := rleid(device_category == "IMV"), by = hospitalization_id]
+
+# STEP FOUR: Filter only rows where the device_category is "IMV"
+imv_runs <- respiratory_support_imv[device_category == "IMV"]
+
+# STEP FIVE: For each imv_run_id, calculate the beginning and end of each IMV run
+# Incorporating the logic for finding the next row's recorded_dttm to set the end time properly
+imv_runs_aggregated <- imv_runs[, .(
+  begin_imv = first(recorded_dttm),  # Start time of the run
+  end_imv = {
+    # Find the next recorded_dttm in the lead row to serve as the end_dttm
+    next_recorded_dttm <- shift(recorded_dttm, type = "lead")
+    fifelse(!is.na(next_recorded_dttm), next_recorded_dttm, last(recorded_dttm))  # Use next row or last "IMV" timestamp
+  }
+), by = .(hospitalization_id, imv_run_id)]
+
+# STEP SIX: Identify gaps less than 24 hours between consecutive IMV runs using shift command then create a column to identify presence of gap
+imv_runs_aggregated[, next_begin_imv := shift(begin_imv, type = "lead"), by = hospitalization_id]
+imv_runs_aggregated[, time_diff_hours := difftime(next_begin_imv, end_imv, units = "hours"), by = hospitalization_id]
+imv_runs_aggregated[, combine_run := (time_diff_hours < 24), by = hospitalization_id]
+
+# STEP SEVEN: Ensure proper combination by handling forward and backward combine flags using shift command
+imv_runs_aggregated[, next_combine := shift(combine_run, type = "lead", fill = FALSE), by = hospitalization_id]
+imv_runs_aggregated[, prev_combine := shift(combine_run, type = "lag", fill = FALSE), by = hospitalization_id]
+
+# STEP EIGHT: Create a combined_run_id ensuring it does not group runs where combine_run is FALSE
+# The ID should increment if combine_run is FALSE and not dependent on neighbors' combine flags.
+imv_runs_aggregated[, combined_run_id := rleid(!(combine_run | prev_combine)), by = hospitalization_id]
+
+# STEP NINE: Aggregate runs based on the combined_run_id for each hospitalization_id
+final_imv_runs <- imv_runs_aggregated[, .(
+  begin_imv = min(begin_imv),  # Earliest begin time for the combined run
+  end_imv = max(end_imv)       # Latest end time for the combined run
+), by = .(hospitalization_id, combined_run_id)]
+
+# STEP TEN: Determine total time of each IMV run
+final_imv_runs[, total_imv_time := as.numeric(difftime(end_imv, begin_imv, units = "hours"))]
+
+# STEP ELEVEN: Only Retain the first IMV Run for each hospitalization_id
+final_imv_runs <- final_imv_runs[, .SD[1], by = hospitalization_id]
+setorder(final_imv_runs, hospitalization_id, begin_imv)
+
+# STEP TWELVE: Filter rows where total_imv_time is greater than or equal to 24 hours
+final_imv_runs_filtered <- final_imv_runs[total_imv_time >= 24]
+final_imv_runs_filtered <- final_imv_runs_filtered[, .(hospitalization_id, begin_imv, end_imv, total_imv_time)]
+
+# Hospital IDs in the IMV Runs:
+hosp_id_imv_runs <- unique(final_imv_runs_filtered$hospitalization_id)
+
+# Trach Times with IMV Runs
+imv_trach_times <- trach_times[hospitalization_id %in% hosp_id_imv_runs]
+imv_trach_times <- imv_trach_times[, .(hospitalization_id, first_trach_dttm)]
+
+# Combined IMV and Trach Times Table
+imv_times_final <- merge(final_imv_runs_filtered, imv_trach_times, by = "hospitalization_id", , all = TRUE)
+
+```
+
+# Establish the Overall Timeline for each Hospitalization
+```{r}
+# Upload Limited Hospitalization and Patient Tables
+hospitalization_time <- fread(paste0(data_dir,"hospitalization.csv.gz"), select = c("patient_id", "hospitalization_id", "admission_dttm", "discharge_dttm", "discharge_name", "discharge_category"))[hospitalization_id %in% hosp_id_imv_runs]
+hospitalization_time <- unique(hospitalization_time, by = "hospitalization_id")
+
+patient_id_time <- unique(hospitalization_time$patient_id)
+patient_time <- fread(paste0(data_dir,"patient.csv.gz"), select = c("patient_id",  "death_dttm"))[patient_id %in% patient_id_time]
+
+# Merge Hospitalization and Patient Across Patient_ID
+pat_hosp_time <- merge(hospitalization_time, patient_time, by = "patient_id", all.x = TRUE)
+setorder(pat_hosp_time, patient_id, admission_dttm)
+
+# Merge with IMV Times 
+pat_hosp_time <- merge(pat_hosp_time, imv_times_final, by = "hospitalization_id", all.x = TRUE)
+pat_hosp_time <- pat_hosp_time[, .(patient_id, hospitalization_id, admission_dttm, discharge_dttm, begin_imv, end_imv, first_trach_dttm, death_dttm, total_imv_time, discharge_name, discharge_category)]
+setorder(pat_hosp_time, patient_id, admission_dttm)
+
+# Was patient intubated at time of discharge?
+pat_hosp_time[, intubated_at_discharge := ifelse(difftime(discharge_dttm, end_imv, units = "hours") <= 2, TRUE, FALSE)]
+
+
+# Filter the rows where first_trach_dttm is after discharge_dttm
+trach_after_discharge <- pat_hosp_time[first_trach_dttm > discharge_dttm]
+
+# View the result
+trach_after_discharge
+
+
+
+
+# Identify Intra-Hospital System Transfers
+pat_hosp[, next_admission_dttm := shift(admission_dttm, type = "lead"), by = patient_id]
+pat_hosp[, time_diff_hours := difftime(next_admission_dttm, discharge_dttm, units = "hours"), by = patient_id]
+setorder(pat_hosp, patient_id, admission_dttm)
+pat_hosp[, transfer_flag := ifelse(discharge_category == "Acute Care Hospital" & time_diff_hours < 24, "Transfer Out", "")]
+
+# Identify the next hospitalization as "Transfer In" if the previous was "Transfer Out"
+# Shift the "Transfer Out" flag to the next row within the same patient_id
+pat_hosp[, next_transfer_out_flag := shift(transfer_flag == "Transfer Out", type = "lag"), by = patient_id]
+
+# If the next_transfer_out_flag is TRUE, flag the current row as "Transfer In"
+pat_hosp[, transfer_flag := ifelse(next_transfer_out_flag == TRUE & transfer_flag == "", "Transfer In", transfer_flag)]
+
+
+# Attach Total IMV Run Time To Pat_Hosp Table
+total_imv_runs <- final_imv_runs_filtered[, .(hospitalization_id, total_imv_time)]
+pat_hosp_imv <- merge(pat_hosp, total_imv_runs, by = "hospitalization_id", all.x = TRUE)
+setorder(pat_hosp_imv, patient_id, admission_dttm)
+pat_hosp_imv[, drop_transfer := ifelse(transfer_flag == "Transfer" & total_imv_time > 72, "Drop Next Row", "")]
+pat_hosp_imv <- pat_hosp_imv[, .(patient_id, hospitalization_id, admission_dttm, discharge_dttm, transfer_flag, drop_transfer)]
+setorder(pat_hosp_imv, patient_id, admission_dttm)
+
+
+intra_hospital_transfers <- pat_hosp[time_diff_hours < 24, .(patient_id, hospitalization_id, next_admission_dttm)]
+
+
+
+# Identify duplicate hospitalization_id values
+duplicate_ids <- pat_hosp[, .N, by = patient_id][N > 1]
+
+duplicate_rows <- pat_hosp[patient_id %in% duplicate_ids$patient_id]
+setorder(duplicate_rows, patient_id, admission_dttm)
+
+duplicate_ids <- adt_demog[, .N, by = hospitalization_id][N > 1]
+
+duplicate_ids %>% unique(hospitalization_id)
+
+# Filter Out Any Patients who are under 18 years old
+core_demog <- pat_hosp_adt[age_at_admission >= 18]
+
+# Retained Hospitalization_IDs
+hosp_id_demog <- unique(pat_hosp_adt_filtered$hospitalization_id)
+
+
+```
+
+```{r}
+
+# *********** PART THREE: Establish Timeline Table *************
+
+
+# Upload CLIF Hospitalization Table
+
+hospitalization <- fread(paste0(data_dir,"hospitalization.csv.gz"), select = c("patient_id", "hospitalization_id", "admission_dttm", "discharge_dttm", "age_at_admission"))[hospitalization_id %in% hosp_id_demog]
+hospitalization <- unique(hospitalization, by = "hospitalization_id")
+
+# Establish Time Line for Each Patient Admission Using 15 minute intervals
+hosp_timeline <- hospitalization[, .(recorded_dttm = seq(from = as.POSIXct(min(admission_dttm)), 
+                                            to = as.POSIXct(max(discharge_dttm)), 
+                                            by = "15 min")), 
+                    by = .(hospitalization_id)]
+
+# ADT Table Upload and conversion of in_dttm to recorded_dttm
+adt <- fread(paste0(data_dir,"adt.csv.gz"), select = c("hospitalization_id", "hospital_id", "in_dttm", "location_category"))[hospitalization_id %in% hosp_id_imv_runs]
+setorder(adt, hospitalization_id, in_dttm)
+adt <- unique(adt, by = c("hospitalization_id", "hospital_id", "in_dttm", "location_category"))
+setnames(adt, "in_dttm", "recorded_dttm")
+
+# Merge ADT and Timeline and remove hospital_id
+adt_timeline <- merge(adt, hosp_timeline, by = c("hospitalization_id", "recorded_dttm"), all = TRUE)
+adt_timeline <- adt_timeline[, .(hospitalization_id, recorded_dttm, location_category)]
+
+# LOCF location_category
+adt_timeline[location_category == "", location_category := NA]
+adt_timeline[, location_category := na.locf(location_category, na.rm = FALSE), by = hospitalization_id]
+
+
+
+
+
+```
+
+
+
+
+
+
+patient_id_imv <- unique(hosp_demog$patient_id)
+patient <- fread(paste0(data_dir,"patient.csv.gz"), select = c("patient_id", "race_category", "ethnicity_category", "sex_category", "death_dttm", "language_name"))[patient_id %in% patient_id_imv]
+
+# Merge Hospitalization and Patient Across Patient_ID
+pat_hosp <- merge(hosp_demog, patient, by = "patient_id", all.x = TRUE)
+setorder(pat_hosp, patient_id, admission_dttm)
+
+
+adt_demog <- fread(paste0(data_dir,"adt.csv.gz"), select = c("hospitalization_id", "hospital_id", "in_dttm", "out_dttm", "location_category"))[hospitalization_id %in% hosp_id_imv_runs]
+adt_demog <- unique(adt_demog, by = c("hospitalization_id", "hospital_id"))
+
+
+
+
+
+# Replace 'your_id' with the specific hospitalization_id you want to view
+hospitalization_id_to_view <- 197267129
+
+# Filter the table to view all rows for the given hospitalization_id
+adt_spec <- adt_demog[hospitalization_id == hospitalization_id_to_view]
+
+hosp_spec <- hosp_demog[hospitalization_id == hospitalization_id_to_view]
+
+# Identify duplicate hospitalization_id values
+duplicate_ids <- adt_demog[, .N, by = hospitalization_id][N > 1]
+
+duplicate_rows <- adt_demog[hospitalization_id %in% duplicate_ids$hospitalization_id]
+
+duplicate_ids <- adt_demog[, .N, by = hospitalization_id][N > 1]
+
+duplicate_ids %>% unique(hospitalization_id)
+
+
+
+
+adt_hosp_id <- unique(adt_demog$hospitalization_id)
+
+
+# Upload Raw Hospitalization Table according to hospitalization_ids with IMV runs >24 hours
+
+hospitalization <- fread(paste0(data_dir,"hospitalization.csv.gz"), select = c("patient_id", "hospitalization_id", "admission_dttm", "discharge_dttm", "age_at_admission"))[hospitalization_id %in% hosp_id_imv_runs]
+hospitalization <- unique(hospitalization, by = "hospitalization_id")
+
+# Upload Patient Table according to unique patient_ids in hospitalization table
+patient_id_imv <- unique(hospitalization$patient_id)
+patient <- fread(paste0(data_dir,"patient.csv.gz"), select = c("patient_id", "race_category", "ethnicity_category", "sex_category", "death_dttm", "language_name"))[patient_id %in% patient_id_imv]
+
+# Create language_category for cleaning language_name row and then clear language_name
+
+
+# Summary Statistics of Cohort
+summary_stats <- patient[, .(
+  race_category_counts = .N, by = race_category,
+  ethnicity_category_counts = .N, by = ethnicity_category,
+  sex_category_counts = .N, by = sex_category,
+  language_name_counts = .N, by = language_name
+)]
+summary_stats_race <- patient[, .N, by = race_category][order(-N)]
+summary_stats_ethnicity <- patient[, .N, by = ethnicity_category][order(-N)]
+summary_stats_sex <- patient[, .N, by = sex_category][order(-N)]
+summary_stats_language <- patient[, .N, by = language_name][order(-N)]
+
+hispanic_english_count <- patient[ethnicity_category == "Hispanic" & language_name == "English", .N]
+hispanic_spanish_count <- patient[ethnicity_category == "Hispanic" & language_name == "Spanish", .N]
+
+
+# Merge Hospitalization and patient tables
+pat_hosp <- merge(hospitalization, patient, by = "patient_id", all.x = TRUE)
+
+summary_stats_hosp <- pat_hosp[, .(
+  race_category_counts_hosp = .N, by = race_category,
+  ethnicity_category_counts_hosp = .N, by = ethnicity_category,
+  sex_category_counts_hosp = .N, by = sex_category,
+  language_name_counts_hosp = .N, by = language_name
+)]
+summary_stats_race_hosp <- pat_hosp[, .N, by = race_category][order(-N)]
+summary_stats_ethnicity_hosp <- pat_hosp[, .N, by = ethnicity_category][order(-N)]
+summary_stats_sex_hosp <- pat_hosp[, .N, by = sex_category][order(-N)]
+summary_stats_language_hosp <- pat_hosp[, .N, by = language_name][order(-N)]
+
+hispanic_english_count_hosp <- pat_hosp[ethnicity_category == "Hispanic" & language_name == "English", .N]
+hispanic_spanish_count_hosp <- pat_hosp[ethnicity_category == "Hispanic" & language_name == "Spanish", .N]
+
+
+
+# Expand table to create 1-hour increments from admission_dttm to discharge_dttm for all hospitalization_ids
+pat_hosp_time <- pat_hosp[, .(recorded_dttm = seq(from = as.POSIXct(min(admission_dttm)), 
+                                            to = as.POSIXct(max(discharge_dttm)), 
+                                            by = "15 min")), 
+                    by = .(hospitalization_id)]
+# Merge 
+pat_hosp_merge_time <- merge(pat_hosp_time, pat_hosp, by = c("hospitalization_id"), all = TRUE)
+
+
+# SOLID THROUGH THIS POINT
+
+
+# Upload tables with recorded_dttm
+vitals <- fread(paste0(data_dir,"vitals.csv.gz"), select = c("hospitalization_id", "recorded_dttm", "vital_category", "vital_value"))[hospitalization_id %in% hosp_id_imv_runs]
+patient_assessments <- fread(paste0(data_dir,"patient_assessments.csv.gz"), select = c("hospitalization_id", "recorded_dttm", "assessment_category", "assessment_group", "numerical_value", "categorical_value", "text_value"))[hospitalization_id %in% hosp_id_imv_runs]
+respiratory_support_new <- fread(paste0(data_dir,"respiratory_support.csv.gz"), select = c("hospitalization_id", "recorded_dttm", "device_category"))[hospitalization_id %in% hosp_id_imv_runs]
+setorder(vitals, hospitalization_id, recorded_dttm)
+setorder(patient_assessments, hospitalization_id, recorded_dttm)
+setorder(respiratory_support_new, hospitalization_id, recorded_dttm)
+
+
+# Filter the Big Tables for the specific Time Ranges Found in PART TWO
+# Join with final_imv_runs_filtered to apply time-based filtering
+filtered_vitals<- merge(
+  vitals,
+  final_imv_runs_filtered[, .(hospitalization_id, begin_imv, end_imv)],  
+  by = "hospitalization_id",
+  allow.cartesian = TRUE  # allows multiple matches per hospitalization_id
+)
+
+# Filter rows where recorded_dttm is between begin_imv and end_imv
+filtered_vitals <- filtered_vitals[
+  recorded_dttm >= begin_imv & recorded_dttm <= end_imv
+]
+
+
+
+# SEEMS TO BE DOING WHAT I WANT THROUGH THIS POINT
+
+
+pat_hosp_vitals_merge <- vitals[pat_hosp_merge_time, on = .(hospitalization_id, recorded_dttm), allow.cartesian = TRUE, nomatch = 0L]
+
+setorder(pat_hosp_vitals_merge, hospitalization_id, recorded_dttm)
+
+pat_hosp_vitals_merge <-merge(pat_hosp_merge_time, vitals, by = c("hospitalization_id", "recorded_dttm"), all = TRUE)
+pat_hosp_vitals_assess_merge <- merge(pat_hosp_vitals_merge, patient_assessments, by = c("hospitalization_id", "recorded_dttm"), all = TRUE)
+
+
+# ADT Table Upload and conversion of in_dttm to recorded_dttm
+adt <- fread(paste0(data_dir,"adt.csv.gz"), select = c("hospitalization_id", "hospital_id", "in_dttm", "location_category"))[hospitalization_id %in% hosp_id_imv_runs]
+setorder(adt, hospitalization_id, in_dttm)
+adt <- unique(adt, by = c("hospitalization_id", "hospital_id", "in_dttm", "location_category"))
+setnames(adt, "in_dttm", "recorded_dttm")
+
+# Labs Table Conversion to recorded_dttm
+labs <- fread(paste0(data_dir,"labs.csv.gz"), select = c("hospitalization_id", "lab_collect_dttm", "lab_order_category", "lab_category", "lab_value", "lab_value_numeric", "reference_unit"))[hospitalization_id %in% hosp_id_imv_runs]
+setorder(labs, hospitalization_id, lab_collect_dttm)
+setnames(labs, "lab_collect_dttm", "recorded_dttm")
+
+# Med Admin Continuous Table Conversion to recorded_dttm
+med_admin_continuous <- fread(paste0(data_dir,"medication_admin_continuous.csv.gz"), select = c("hospitalization_id", "admin_dttm", "med_group", "mar_action_name"))[hospitalization_id %in% hosp_id_imv_runs]
+setorder(med_admin_continuous, hospitalization_id, admin_dttm)
+setnames(med_admin_continuous, "admin_dttm", "recorded_dttm")
+
+
+```
+
+
+
+
+```{r}
+
+
+
+
+# ***** TROUBLE SHOOTING MECHANISMS *****
+
+# Identify duplicate hospitalization_id values
+duplicate_ids <- hospitalization[, .N, by = hospitalization_id][N > 1]
+
+duplicate_rows <- hospitalization[hospitalization_id %in% duplicate_ids$hospitalization_id]
+
+duplicate_ids <- hospitalization[, .N, by = hospitalization_id][N > 1]
+
+hospitalization_filtered %>% unique(hospitalization_id)
+
+
+
+# Replace 'your_id' with the specific hospitalization_id you want to view
+hospitalization_id_to_view <- 326811723
+
+# Filter the table to view all rows for the given hospitalization_id
+resp_supp_spec_imv <- hospitalization[hospitalization_id == hospitalization_id_to_view]
+
+
+resp_imv %>% distinct(hospitalization_id)
+
+
+# Replace 'your_id' with the specific hospitalization_id you want to view
+hospitalization_id_to_view <- 168669295
+
+# Filter the table to view all rows for the given hospitalization_id
+resp_supp_spec_imv <- respiratory_support_imv[hospitalization_id == hospitalization_id_to_view]
+```

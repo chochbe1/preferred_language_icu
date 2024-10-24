@@ -1,0 +1,1139 @@
+# CREATE PREFERRED LANGUAGE ICU DATA TABLES
+
+# Setup Step: Setup libraries, run automatically
+```{r setup, include=FALSE}
+
+# Install Packages
+
+packages <- c("zoo", "data.table", "dplyr", "lubridate")
+install_if_missing <- function(package) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package, dependencies = TRUE)
+    library(package, character.only = TRUE)
+  }
+}
+ 
+sapply(packages, install_if_missing)
+
+# Load necessary libraries
+library(data.table)
+library(dplyr)
+library(zoo)  # for na.locf function
+library(lubridate)
+
+```
+
+# PART ONE: 
+# ***Define the data directory for the rest of the script
+# ***Upload Raw Respiratory, Hospitalization, and Patient Tables
+# ***Initial identification and cleaning of IMV patients and tracheostomy patients
+
+```{r}
+# Define the Directory
+data_dir <- "/share/projects/data/circe/v20240931a/clif/" # Add your directory information here
+
+# Add your File Type here?
+
+
+# Add your institution here
+Institution <- "Penn"
+
+
+# STEP 1: Load Raw CLIF Respiratory Support, Hospitalization, and Patient Tables
+respiratory_support <- fread(paste0(data_dir, "respiratory_support.csv.gz"), select = c("hospitalization_id", "recorded_dttm", "device_category", "tracheostomy", "fio2_set"))
+hospitalization <- fread(paste0(data_dir, "hospitalization.csv.gz"), select = c("patient_id", "hospitalization_id", "admission_dttm", "discharge_dttm", "age_at_admission", "discharge_category"))
+hospitalization <- unique(hospitalization, by = "hospitalization_id")
+patient <- fread(paste0(data_dir,"patient.csv.gz"))
+
+
+# STEP 2: Identifying the tracheostomy patients
+# Identify hospitalization_ids that have tracheostomy at some point during their hospitalization and earliest timestamp for this finding
+trach_resp <- respiratory_support[tracheostomy == "1"]
+trach_dttm_table <- trach_resp[, .(trach_dttm = min(recorded_dttm)), by = hospitalization_id]
+hosp_id_trach <- unique(trach_resp$hospitalization_id)
+
+# Identify hospital_ids that have "trach collar" device at any point in hospitalization and corresponding earliest timestamp
+trach_collar_resp <- respiratory_support[device_category == "Trach Collar"]
+trach_collar_dttm_table <- trach_collar_resp[, .(trach_collar_dttm = min(recorded_dttm)), by = hospitalization_id]
+hosp_id_trach_collar <- unique(trach_collar_resp$hospitalization_id)
+
+# Merge the Two Trach Hospital DTTM Tables
+trach_times <- merge(trach_dttm_table, trach_collar_dttm_table, by = "hospitalization_id", , all = TRUE)
+trach_times[, first_trach_dttm := pmin(trach_dttm, trach_collar_dttm, na.rm = TRUE)]
+
+# Hospitalization IDs with trach
+hosp_id_trach_total <- unique(trach_times$hospitalization_id)
+
+
+# STEP 3: Identify earliest "IMV" for each hospitalization_id
+# Identify earliest "IMV" for each hospitalization_id
+resp_supp_imv <- respiratory_support[device_category == "IMV"]
+imv_earliest <- resp_supp_imv[device_category == "IMV", .(
+  first_imv_dttm = min(recorded_dttm)
+), by = hospitalization_id]
+
+# Hospitalization IDs with IMV
+hosp_id_imv <- unique(resp_supp_imv$hospitalization_id)
+
+
+# STEP 4: Merge Trach Timeline with Earliest IMV Time to create expanded timeline for trach patients
+imv_trach_timeline <- merge(trach_times, imv_earliest, by = "hospitalization_id", , all = TRUE)
+imv_trach_timeline <- imv_trach_timeline[, .(hospitalization_id, first_trach_dttm, first_imv_dttm)]
+imv_trach_id <- unique(imv_trach_timeline$hospitalization_id)
+
+
+# STEP 5: Form Specific Patient and Hospitalization Tables for identified IDs and then merge them together
+hospitalization_limited <- hospitalization[hospitalization_id %in% imv_trach_id]
+hospitalization_limited <- hospitalization_limited[, .(patient_id, hospitalization_id, admission_dttm, discharge_dttm, discharge_category, age_at_admission)]
+patient_id_limited <- unique(hospitalization_limited$patient_id)
+patient_limited <- patient[patient_id %in% patient_id_limited]
+pat_hosp_limited <- merge(hospitalization_limited, patient_limited, by = "patient_id", all.x = TRUE)
+
+
+# STEP 6: Merge Limited Patient Hospitalization Table with the Trach Timeline from Step 4 to form Admission Timeline
+admission_timeline <- merge(pat_hosp_limited, imv_trach_timeline, by = "hospitalization_id", all.x = TRUE)
+admission_timeline <- admission_timeline[, .(patient_id, hospitalization_id, admission_dttm, discharge_dttm, first_imv_dttm, first_trach_dttm, death_dttm, age_at_admission, discharge_category)]
+setorder(admission_timeline, patient_id, admission_dttm)
+
+# Intermediate Step: Filter Out any Patient Younger than 18 at admission
+admission_timeline <- admission_timeline[age_at_admission >= 18]
+
+
+# STEP 7: At the patient_id level, filter out any Tracheostomy Patients who have no mechanical ventilation values in any of their hospitalizations
+# Flag patient IDs with tracheostomy
+admission_timeline[, trach_flag := any(!is.na(first_trach_dttm)), by = patient_id]
+
+# For each patient_id check if all first_imv_dttm values are NA
+admission_timeline[, all_imv_na := all(is.na(first_imv_dttm)), by = patient_id]
+
+# Patients with Trach but no IMV values 
+patients_trach_no_imv <- admission_timeline[trach_flag == TRUE & all_imv_na == TRUE, unique(patient_id)]
+
+# Remove the patient_ids with trach and no IMV
+admission_timeline_filtered <- admission_timeline[!(patient_id %in% patients_trach_no_imv)]
+setorder(admission_timeline_filtered, patient_id, admission_dttm)
+
+# Total Hospitalization_IDs in admission_timeline_filtered
+admission_timeline_hosp_id <- unique(admission_timeline_filtered$hospitalization_id)
+
+```
+
+# PART TWO: Thorough Cleaning of All Identified Admissions
+# ***Separate out patients with one hospitalization vs those with multiple admissions to determine accurate timeline
+# ***Focus on cleaning the trach patients to remove as many unidentified tracheostomy episodes as possible
+
+```{R}
+# STEP 1: Identify patients with only one hospitalization
+single_hospitalizations <- admission_timeline_filtered[, .N, by = patient_id][N == 1]
+single_hosp_patients <- unique(single_hospitalizations$patient_id)
+
+# Filter the main table to only include patients with single hospitalizations
+single_hosp_data <- admission_timeline_filtered[patient_id %in% single_hosp_patients]
+single_hosp_data[, all_imv_na := NULL]
+single_hosp_id <- unique(single_hosp_data$hospitalization_id)
+
+
+# STEP 2: Identify Single Admissions Trach Patients
+# Filtering single hospital admissions for those with a True trach flag
+single_hosp_ids_trach <- single_hosp_data[trach_flag == TRUE, unique(hospitalization_id)]
+single_trach_data <- single_hosp_data[hospitalization_id %in% single_hosp_ids_trach]
+single_trach_data <- single_trach_data[, .(hospitalization_id, admission_dttm, discharge_dttm, first_imv_dttm, first_trach_dttm)]
+
+
+# STEP 3: Identify patients with repeat hospitalizations
+# Filter the main table to only include patients with repeat hospitalizations
+repeat_hosp_ids <- setdiff(admission_timeline_hosp_id, single_hosp_id)
+repeat_hosp_data <- admission_timeline_filtered[hospitalization_id %in% repeat_hosp_ids]
+repeat_hosp_data[, all_imv_na := NULL]
+setorder(repeat_hosp_data, patient_id, admission_dttm)
+
+
+# STEP 4: Identify Repeat Admission Trach Patients
+repeat_hosp_ids_trach <- repeat_hosp_data[trach_flag == TRUE, unique(hospitalization_id)]
+
+
+# STEP 5: Identify repeat admission trach patients who have missing first_trach_dttm values to determine if those missing values should be filled in with previously identified trach times
+
+# Identify Patients with Flag Trach True and empty "first_trach_dttm" values. These are missing data patients and will be processed differently than complete patients
+repeat_hosp_data[, trach_info_missing := ifelse(trach_flag == TRUE & is.na(first_trach_dttm), TRUE, FALSE)]
+patient_ids_trach_info_missing <- repeat_hosp_data[trach_info_missing == TRUE, unique(patient_id)]
+
+# Select only the Patients with Missing Trach Information
+repeat_hosp_trach_missing <- repeat_hosp_data[patient_id %in% patient_ids_trach_info_missing]
+setorder(repeat_hosp_trach_missing, patient_id, admission_dttm)
+
+
+# STEP 6: Cleaning of the "missing" first_trach_dttm patients
+# In this step, if first_trach_dttm info is missing from the hospitalization and the first_trach_dttm date from the previous hospitalization is within 60 days of the current admission_dttm, we will update the first_trach_dttm for that hospitalization to the value from the previous hospitalization. This will help filter out post-trach data later on.
+
+
+# For each patient, check if first_trach_dttm is missing and update it with the previous hospitalization's trach date if within 60 days
+repeat_hosp_trach_missing[, prev_trach_dttm := shift(first_trach_dttm, type = "lag"), by = patient_id]
+repeat_hosp_trach_missing[, days_since_last_admission := as.numeric(difftime(admission_dttm, prev_trach_dttm, units = "days"))]
+repeat_hosp_trach_missing[, fill_trach := (is.na(first_trach_dttm) & !is.na(prev_trach_dttm) & days_since_last_admission <= 60)]
+
+# Cleaning step
+# Cleaned First Trach DTTM Info for repeat Trach Patients with Missing Trach Info
+repeat_hosp_trach_missing[fill_trach == TRUE, first_trach_dttm := prev_trach_dttm]
+repeat_hosp_trach_missing <- repeat_hosp_trach_missing[, .(hospitalization_id, admission_dttm, discharge_dttm, first_imv_dttm, first_trach_dttm)]
+hospitalization_ids_trach_repeat_missing <- unique(repeat_hosp_trach_missing$hospitalization_id)
+
+
+# STEP 7: Identify Repeat Hospitalization patients with tracheostomy and no missing data
+hospitalization_ids_trach_repeat_complete <- setdiff(repeat_hosp_ids_trach, hospitalization_ids_trach_repeat_missing)
+repeat_hosp_trach_complete <- repeat_hosp_data[hospitalization_id %in% hospitalization_ids_trach_repeat_complete]
+repeat_hosp_trach_complete <- repeat_hosp_trach_complete[, .(hospitalization_id, admission_dttm, discharge_dttm, first_imv_dttm, first_trach_dttm)]
+setorder(repeat_hosp_trach_complete, hospitalization_id, admission_dttm)
+
+
+# STEP 8: Merge Repeat Trach Complete and Repeat Trach Missing Data
+repeat_trach_final <- union(repeat_hosp_trach_complete, repeat_hosp_trach_missing)
+
+
+# STEP 9: Merge Repeat and Single Trach Hospitalization Tables
+trach_final <- union(repeat_trach_final, single_trach_data)
+
+
+# STEP 10: Filter Out Non-IMV Hospitalizations
+trach_final_imv <- trach_final[!is.na(first_imv_dttm)]
+trach_final_imv_id <- unique(trach_final_imv$hospitalization_id)
+
+```
+
+
+# PART THREE: Develop Tables for Non-Trach Patients with IMV hospitalizations for IMV Run Calculations in PART FIVE
+# ***Combine repeat and single admissions non-trach patients and merge with respiratory_support & hospitalization
+
+```{R}
+# STEP 1: Identify Non-Trach Patients with Single Admissions
+single_hosp_id_ett <- setdiff(single_hosp_id, single_hosp_ids_trach)
+
+
+# STEP 2: Identify Non-Trach Patients with Repeat Admissions
+repeat_hosp_id_ett <- setdiff(repeat_hosp_ids, repeat_hosp_ids_trach)
+
+
+# STEP 3: Merge Singele and Repeat Hospitalization IDs
+hosp_id_ett <- union(single_hosp_id_ett, repeat_hosp_id_ett)
+
+
+# STEP 4: Bring in Specific Respiratory Support and Hospitalization Tables for These IDs
+respiratory_support_ett <- respiratory_support[hospitalization_id %in% hosp_id_ett]
+hospitalization_ett <- hospitalization[hospitalization_id %in% hosp_id_ett]
+
+
+# STEP 5: Merge Respiratory Support and Hospitalization
+resp_hosp_ett <- merge(respiratory_support_ett, hospitalization_ett, by = "hospitalization_id", all.x = TRUE, allow.cartesian = TRUE)
+resp_hosp_ett <- resp_hosp_ett[, .(hospitalization_id, recorded_dttm, device_category, admission_dttm, discharge_dttm)]
+
+```
+
+
+# PART FOUR: Develop Tables for Trach Patients with IMV hospitalizations for IMV Run Calculations in PART FIVE
+# ***Merge previously cleaned trach hospitalizations with respiratory_support and hospitalization tables
+# ***Filter out any time periods after initiation of tracheostomy as identified earlier
+
+```{R}
+# STEP 1: Create Trach Respiratory Support Table
+respiratory_support_trach <- respiratory_support[hospitalization_id %in% trach_final_imv_id]
+
+
+# STEP 2: Convert any blank values in device_category to "NA" and then perform LOCF to fill device_category column
+respiratory_support_trach[device_category == "", device_category := NA]
+respiratory_support_trach[, device_category := na.locf(device_category, na.rm = FALSE), by = hospitalization_id]
+
+
+# STEP 3: Merge Respiratory Support Trach Table with Trach Final IMV Table from PART TWO
+resp_trach_imv <- merge(respiratory_support_trach, trach_final_imv, by = "hospitalization_id", all.x = TRUE)
+resp_trach_imv <- resp_trach_imv %>%
+  select(-tracheostomy, -first_imv_dttm)
+
+
+# STEP 4: # Filter out rows where recorded_dttm is before trach_dttm and return table to original columns
+resp_pre_trach_imv <- resp_trach_imv[recorded_dttm < first_trach_dttm]
+
+
+# STEP 5: Identify hosp_ids where at least one IMV is documented
+valid_hosp_ids <- resp_pre_trach_imv %>%
+  filter(device_category == "IMV") %>%
+  distinct(hospitalization_id)
+
+
+# STEP 6: Remove hospitalization_ids without "IMV"
+resp_pre_trach_imv_final <- resp_pre_trach_imv %>%
+  filter(hospitalization_id %in% valid_hosp_ids$hospitalization_id)
+resp_pre_trach_imv_id <- unique(resp_pre_trach_imv_final$hospitalization_id)
+
+```
+
+
+# PART FIVE: Develop IMV Run Tables
+# ***Merge Cleaned Trach and Non-Trach IMV Information from previous parts
+# ***Use LOCF and RLEID logic to fill out tables and identify runs of mechanical ventilation
+# ***Aggregating IMV runs within 24 hours of one another
+# ***Selecting only for runs over 24 hours
+
+```{R}
+# STEP 1: Establish Timeline Information (admission time, discharge time, etc) for both trach and non-trach patients and merge them together
+hospitalization_ett_time <- hospitalization_ett[, .(hospitalization_id, admission_dttm, discharge_dttm)]
+trach_imv_time <- trach_final_imv[hospitalization_id %in% resp_pre_trach_imv_id, .(hospitalization_id, admission_dttm, discharge_dttm)]
+timeline_info <- union(hospitalization_ett_time, trach_imv_time)
+
+
+# STEP 2: Merge Cleaned Trach and Non-Trach Respiratory Tables
+respiratory_support_imv <- rbind(resp_pre_trach_imv_final, resp_hosp_ett, use.names = TRUE, fill = TRUE)
+setorder(respiratory_support_imv, hospitalization_id, recorded_dttm)
+
+
+# STEP 3: Convert any blank values in device_category to "NA" and then perform LOCF to fill device_category column
+respiratory_support_imv[device_category == "", device_category := NA]
+respiratory_support_imv[, device_category := na.locf(device_category, na.rm = FALSE), by = hospitalization_id]
+
+
+# STEP 4: Use rleid to create unique IDs for each run of "IMV" in the device_category
+respiratory_support_imv[, imv_run_id := rleid(device_category == "IMV"), by = hospitalization_id]
+
+
+# STEP 5: For each imv_run_id, calculate the beginning and end of each IMV run
+# Incorporating the logic for finding the next row's recorded_dttm to set the end time properly
+imv_runs_aggregated <- respiratory_support_imv[device_category == "IMV", .(
+  begin_imv = first(recorded_dttm),  # Start time of the IMV run
+  end_imv = {
+    # Find the next recorded_dttm, regardless of whether it's IMV or not
+    next_recorded_dttm <- shift(recorded_dttm, type = "lead")
+    fifelse(!is.na(next_recorded_dttm), next_recorded_dttm, last(recorded_dttm))  # Use next row's time or last IMV timestamp
+  }
+), by = .(hospitalization_id, imv_run_id)]
+
+
+# STEP 6: Identify gaps less than 24 hours between consecutive IMV runs using shift command then create a column to identify presence of gap
+imv_runs_aggregated[, next_begin_imv := shift(begin_imv, type = "lead"), by = hospitalization_id]
+imv_runs_aggregated[, time_diff_hours := difftime(next_begin_imv, end_imv, units = "hours"), by = hospitalization_id]
+imv_runs_aggregated[, combine_run := (time_diff_hours < 24), by = hospitalization_id]
+
+
+# STEP 7: Ensure proper combination by handling forward and backward combine flags using shift command
+imv_runs_aggregated[, next_combine := shift(combine_run, type = "lead", fill = FALSE), by = hospitalization_id]
+imv_runs_aggregated[, prev_combine := shift(combine_run, type = "lag", fill = FALSE), by = hospitalization_id]
+
+
+# STEP 8: Create a combined_run_id ensuring it does not group runs where combine_run is FALSE
+# The ID should increment if combine_run is FALSE and not dependent on neighbors' combine flags.
+imv_runs_aggregated[, combined_run_id := rleid(!(combine_run | prev_combine)), by = hospitalization_id]
+
+
+# STEP 9: Aggregate runs based on the combined_run_id for each hospitalization_id
+final_imv_runs <- imv_runs_aggregated[, .(
+  begin_imv = min(begin_imv),  # Earliest begin time for the combined run
+  end_imv = max(end_imv)       # Latest end time for the combined run
+), by = .(hospitalization_id, combined_run_id)]
+
+
+# STEP 10: Determine total time of each IMV run
+final_imv_runs[, total_imv_time := as.numeric(difftime(end_imv, begin_imv, units = "hours"))]
+
+
+# STEP 11: Only Retain the first IMV Run for each hospitalization_id 
+# **** NEED TO RE-CONSIDER THIS STEP - Should I filter for first run only afer ruling out those under 24 hours (i.e. flip the order of Step 11 and Step 12) ****
+final_imv_runs <- final_imv_runs[, .SD[1], by = hospitalization_id]
+
+
+# STEP 12: Filter rows where total_imv_time is greater than or equal to 24 hours
+final_imv_runs_filtered <- final_imv_runs[total_imv_time >= 24]
+final_imv_runs_filtered <- final_imv_runs_filtered[, .(hospitalization_id, begin_imv, end_imv, total_imv_time)]
+
+
+# Hospital IDs in the IMV Runs:
+hosp_id_imv_runs <- unique(final_imv_runs_filtered$hospitalization_id)
+
+```
+
+
+# PART SIX: Clean The Identified IMV Runs
+# ***Identify Intra-Hospital Transfers and only keep the first admission
+# ***Identify Trach Patients who weren't previously flagged as such (those with no trach flag and no trach collar values but remained mechanically ventilated at the time of discharge)
+# ***Filter out the trach patients and the second hospitalization for the transfers
+
+```{r}
+
+
+#Step 1: Flag internal hospital system transfers as discharge_dttms and admission_dttms within 24 hours that have discharge_category of "Acute Care Hospital" or "Other" as "Transfer Out"
+repeat_hosp_transfer_data <- repeat_hosp_data[, next_admission_dttm := shift(admission_dttm, type = "lead"), by = patient_id]
+repeat_hosp_transfer_data[, time_diff_hours := difftime(next_admission_dttm, discharge_dttm, units = "hours"), by = patient_id]
+repeat_hosp_transfer_data[, transfer_status := ifelse(discharge_category %in% c("Acute Care Hospital", "Other") & time_diff_hours < 24, "Transfer Out", "")]
+
+#Step 2: Flag next hospitalization as "Transfer In"
+repeat_hosp_transfer_data[, next_transfer_status := shift(transfer_status, type = "lag"), by = patient_id]
+repeat_hosp_transfer_data[next_transfer_status == "Transfer Out", transfer_status := "Transfer In"]
+
+#Step 3: Flag "Transfer In then Out" for hospitalizations that are followed by "Transfer Out"
+repeat_hosp_transfer_data[, lead_transfer_status := shift(transfer_status, type = "lead"), by = patient_id]
+repeat_hosp_transfer_data[transfer_status == "Transfer In" & lead_transfer_status == "Transfer Out", transfer_status := "Transfer In then Out"]
+
+repeat_hosp_transfer_data_final <- repeat_hosp_transfer_data %>%
+  select(-next_transfer_status, -next_admission_dttm, -time_diff_hours, -patient_id, -discharge_category, -first_trach_dttm, -trach_flag, -trach_info_missing, -admission_dttm, -discharge_dttm, -first_imv_dttm, -death_dttm, -lead_transfer_status) # Clean up temporary columns
+
+# Final Transfer Table
+transfer_table <- repeat_hosp_transfer_data_final[transfer_status != ""]
+
+
+# STEP 4: Bring in Previously Identified Data Tables to Help Form Final Hospitalization Timeline for IMV Run Patients
+timeline_info_imv_runs <- timeline_info[hospitalization_id %in% hosp_id_imv_runs, .(hospitalization_id, admission_dttm, discharge_dttm)]
+timeline_info_imv_runs <- unique(timeline_info_imv_runs, by = "hospitalization_id")
+
+discharge_category_imv <- hospitalization[hospitalization_id %in% hosp_id_imv_runs]
+discharge_category_imv <- discharge_category_imv[, .(patient_id, hospitalization_id, discharge_category)]
+discharge_category_imv <- unique(discharge_category_imv, by = "hospitalization_id")
+
+trach_final_imv_runs <- trach_final_imv[hospitalization_id %in% hosp_id_imv_runs]
+trach_final_imv_runs <- trach_final_imv_runs[, .(hospitalization_id, first_trach_dttm)]
+trach_final_imv_runs <- unique(trach_final_imv_runs, by = "hospitalization_id")
+
+# STEP 5: Merge STEP 4 Tables with the Final IMV Runs Filtered Table Developed in PART FIVE
+# I Know there must be a more efficient way to do this step
+
+hospitalization_timeline_imv <- merge(timeline_info_imv_runs, final_imv_runs_filtered, by = "hospitalization_id", all.x = TRUE)
+
+hospitalization_timeline <- merge(hospitalization_timeline_imv, discharge_category_imv, by = "hospitalization_id", all.x = TRUE)
+
+hospitalization_time <- merge(hospitalization_timeline, trach_final_imv_runs, by = "hospitalization_id", all.x = TRUE)
+
+hosp_time <- merge(hospitalization_time, transfer_table, by = "hospitalization_id", all.x = TRUE)
+hosp_time <- hosp_time[, .(patient_id, hospitalization_id, admission_dttm, discharge_dttm, begin_imv, end_imv, total_imv_time, first_trach_dttm, discharge_category, transfer_status)]
+setorder(hosp_time, patient_id, admission_dttm)
+
+# STEP 6: Flag Patients Ventilated within 2 hours of Discharge
+hosp_time[, ventilated_at_discharge := ifelse(difftime(discharge_dttm, end_imv, units = "hours") <= 2, TRUE, FALSE)]
+
+
+# STEP 7: Identify Trached Patients who weren't previously flagged
+# Was patient mechanically ventilated at discharge and discharge_category is something other than "Expired", "Other", or "Acute Care Hospital"?
+hosp_time[, missed_trach := 
+  ifelse(ventilated_at_discharge == "TRUE" & 
+         !(discharge_category %in% c("Expired", "Other", "Acute Care Hospital", "Hospice")), 
+         TRUE, FALSE)]
+
+
+# STEP 8: Identify Patients with Linked Hospitalizations and flag them as internal transfers
+hosp_time[, internal_transfer := FALSE]
+hosp_time[, internal_transfer := 
+  (transfer_status == "Transfer In" & 
+   shift(transfer_status) %in% c("Transfer Out", "Transfer In then Out")),
+  by = patient_id]
+
+num_internal_transfers <- hosp_time[internal_transfer == TRUE, .N]
+
+num_missed_trach <- hosp_time[missed_trach == TRUE, .N]
+
+# STEP 9: Remove All Hospitalizations with Missed Trach Flag or internal transfer flag
+hosp_time_clean <- hosp_time[
+  !(missed_trach == TRUE | internal_transfer == TRUE) | 
+  is.na(missed_trach) | is.na(internal_transfer) | 
+  missed_trach == "" | internal_transfer == ""
+]
+hosp_time_clean <- hosp_time_clean %>%
+  select(-missed_trach, -ventilated_at_discharge, -internal_transfer)
+
+hosp_time_clean_id <- unique(hosp_time_clean$hospitalization_id)
+
+```
+
+
+# PART SEVEN: - Identify patients with missing RASS Values
+# ***Load patient assessments, identify first RASS time 
+# ***Flag hospitalizations with missing RASS values between 2 hours before and 8 hours after IMV
+
+```{R}
+
+# STEP 1: Load Patient Assessments For Hospitalization_IDs above
+patient_assessments <- fread("/share/projects/data/circe/v20240331/clif/patient_assessments.csv.gz", 
+                             select = c("hospitalization_id", "recorded_dttm", "assessment_category", 
+                                        "assessment_group", "numerical_value", "categorical_value", "text_value"))[hospitalization_id %in% hosp_time_clean_id]
+
+
+# STEP 2: Form RASS Specific Patient Assessment Table
+pat_assess_rass <- patient_assessments[assessment_category == "RASS"]
+setorder(pat_assess_rass, hospitalization_id, recorded_dttm)
+
+
+# STEP 3: Merge Hosp Time Clean with RASS
+hosp_time_rass <- merge(hosp_time_clean, pat_assess_rass, by = "hospitalization_id", all.x = TRUE)
+
+
+# STEP 4: Identify earliest RASS time for each hospitalization
+# Subtract 2 hours from begin_imv and apply the filters
+hosp_time_rass_filt <- hosp_time_rass[recorded_dttm > (begin_imv - hours(2)) & recorded_dttm < end_imv]
+
+# Form new table with earliest RASS times
+hosp_first_rass <- hosp_time_rass_filt[, .(first_rass_dttm = min(recorded_dttm)), by = hospitalization_id]
+
+# Merge first RASS time with Hosp Time Clean to form Current Timeline
+hosp_rass_timeline <- merge(hosp_time_clean, hosp_first_rass, by = "hospitalization_id", all.x = TRUE)
+
+
+# STEP 5: Calculate time between IMV and first RASS and flag those with greater than 8 hours between
+# Calculate Time Between First RASS and Begin IMV
+hosp_rass_timeline[, time_to_first_rass := as.numeric(difftime(first_rass_dttm, begin_imv, units = "hours"))]
+
+# Flag Those with 8 hour gaps 
+hosp_rass_timeline[, flag_greater_than_8h := time_to_first_rass > 8]
+
+num_rass_missing <- hosp_rass_timeline[flag_greater_than_8h == TRUE, .N]
+
+# STEP 6: Remove All Hospitalizations with Delayed RASS Times
+hosp_rass_clean <- hosp_rass_timeline[flag_greater_than_8h == FALSE | is.na(flag_greater_than_8h) | flag_greater_than_8h == ""]
+hosp_rass_clean[, c("first_rass_dttm", "time_to_first_rass", "flag_greater_than_8h") := NULL]
+
+
+hosp_id_rass_clean <- unique(hosp_rass_clean$hospitalization_id)
+pat_id_rass_clean <- unique(hosp_rass_clean$patient_id)
+
+```
+
+
+# PART EIGHT: Final Cleaning Step: Identify hospitalizations with missing vitals data
+# ***Load in remaining CLIF Tables and identify those hospitalizations with missing vitals values
+
+
+```{R}
+
+# STEP 1: Upload CLIF Vitals 
+vitals <- fread(paste0(data_dir,"vitals.csv.gz"), select = c("hospitalization_id", "recorded_dttm", "vital_category", "vital_value"))[hospitalization_id %in% hosp_id_rass_clean]
+setorder(vitals, hospitalization_id, recorded_dttm)
+
+hosp_id_vitals_clean <- unique(vitals$hospitalization_id)
+
+# STEP 2: Upload CLIF Labs
+# Labs Table Conversion to recorded_dttm
+# Using Lab Collect DTTM as the marker instead of order or result
+labs <- fread(paste0(data_dir,"labs.csv.gz"), select = c("hospitalization_id", "lab_collect_dttm", "lab_order_category", "lab_category", "lab_value", "lab_value_numeric", "reference_unit"))[hospitalization_id %in% hosp_id_vitals_clean]
+setorder(labs, hospitalization_id, lab_collect_dttm)
+setnames(labs, "lab_collect_dttm", "recorded_dttm")
+
+
+# STEP 3: Upload CLIF Continuous Meds
+meds <- fread(paste0(data_dir,"medication_admin_continuous.csv.gz"))[hospitalization_id %in% hosp_id_vitals_clean]
+
+
+# STEP 4: Establish the timeline
+# Develop Specific Time Range to Pull Data From
+hosp_clean_time <- hosp_rass_clean[, .(hospitalization_id, begin_imv, end_imv, total_imv_time)]
+
+
+# Expand table to create 1-hour increments from admission_dttm to discharge_dttm for all hospitalization_ids
+hosp_clean_timeline <- hosp_clean_time[, .(recorded_dttm = seq(
+                                          from = as.POSIXct(min(begin_imv)) - hours(24), 
+                                          to = as.POSIXct(min(begin_imv)),
+                                          by = "1 hour")), 
+                                  by = .(hospitalization_id)]
+
+
+```
+
+
+# PART NINE: Identify Paralyzed Patients
+
+```{R}
+
+# STEP 1: Filter only for paralytic meds
+meds_paralytics <- meds[med_group == "paralytics"]
+
+
+# STEP 2: Filter only for doses >0
+meds_paralytics_filtered <- meds_paralytics[med_dose > 0]
+
+
+# STEP 3: Identify earliest admin_dttm for doses >0 for each hospitalization
+earliest_paralytics <- meds_paralytics[, .(earliest_paralytic_dttm = min(admin_dttm)), by = hospitalization_id]
+
+
+# STEP 4: Merge with hosp_rass_clean
+paralytic_clean <- merge(hosp_rass_clean, earliest_paralytics, by = "hospitalization_id", all.x = TRUE)
+
+
+# STEP 5: Identify patients paralyzed within first 48 hours after beginning mechanical ventilation
+paralytic_clean[, paralyzed := as.logical(abs(difftime(earliest_paralytic_dttm, begin_imv, units = "hours")) <= 48)]
+
+# STEP 6: Fill Table Out and Choose Only hospitalization and paralytic data
+paralytic_clean[, paralyzed := fifelse(is.na(paralyzed) | paralyzed == "", FALSE, paralyzed)]
+paralytic_final <- paralytic_clean[, .(hospitalization_id, paralyzed)]
+
+
+```
+
+
+
+# PART TEN: Build RASS Percentage Table
+# ***This Table is still under development
+```{R}
+
+# STEP 1: Filter previous RASS table only for those with clean hospitalization ids
+pat_assess_rass_filt <- pat_assess_rass[hospitalization_id %in% hosp_id_rass_clean]
+setorder(pat_assess_rass_filt, hospitalization_id, recorded_dttm)
+
+
+# STEP 2: Reshape the data to spread RASS into a column
+pat_assess_rass <- dcast(pat_assess_rass, 
+                   hospitalization_id + recorded_dttm ~ assessment_category, 
+                   value.var = "numerical_value", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+pat_assess_rass <- pat_assess_rass[, .(hospitalization_id, recorded_dttm, RASS)]
+
+
+# STEP 3: Merge Hosp Time Clean with RASS
+rass_hosp_clean <- merge(hosp_rass_clean, pat_assess_rass, by = "hospitalization_id", all.x = TRUE)
+
+
+# STEP 4: Merge with Timeline
+rass_timeline <- merge(hosp_clean_timeline, rass_hosp_clean, by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+
+# STEP 5: Use LOCF to fill out missing RASS Data
+rass_timeline[RASS == "", assessment_category := NA]
+rass_timeline[, RASS := na.locf(RASS, na.rm = FALSE), by = hospitalization_id]
+
+
+# STEP 6: Filter only for values between begin_imv and 72 hours after IMV (or if extubated/expired before 72 hours then however long they were ventilated for)
+
+# Calculate start_time
+rass_timeline[, start_time := as.POSIXct(begin_imv)]
+
+# Calculate end_time based on the condition for each hospitalization_id
+rass_timeline[, end_time := ifelse(total_imv_time >= 72, 
+                                      as.POSIXct(begin_imv) + hours(72),  
+                                      as.POSIXct(end_imv)), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+rass_hosp_filt <- rass_timeline[recorded_dttm >= start_time & recorded_dttm <= end_time]
+rass_hosp_filt <- rass_hosp_filt[, .(hospitalization_id, recorded_dttm, RASS)]
+
+
+# STEP 7: Identify the percent time spent in deep sedation
+
+
+```
+
+
+# PART ELEVEN: Develop SOFA SCORE Model
+# ***Still under development
+```{R}
+
+# STEP 1: Determine Height, Weight, and BMI Baseline
+# THIS STEP STILL UNDER DEVELOPMENT AND NOT YET IMPLEMENTED TO CODE BELOW
+# Need baseline kg to make SOFA Score accurate
+
+# Weight, Height Specific Vitals
+vitals_weight_height <- vitals[vital_category %in% c("weight_kg", "height_cm")]
+
+vitals_weight_height %>% distinct(hospitalization_id)
+
+# Reshape the data to put weight into separate columns, using 'mean' to handle duplicates
+vitals_weight_height <- dcast(vitals_weight_height, 
+                   hospitalization_id + recorded_dttm ~ vital_category, 
+                   value.var = "vital_value", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+vitals_weight_height <- vitals_weight_height[, .(hospitalization_id, recorded_dttm, weight_kg, height_cm)]
+setorder(vitals_weight_height, hospitalization_id, recorded_dttm)
+
+# Merge with hosp_clean_time
+hosp_clean_weight_height <- merge(hosp_clean_time, vitals_weight_height, by = "hospitalization_id", all = TRUE)
+
+# *******
+
+
+# STEP 2: Develop Data Tables Needed for SOFA Score Tabulation
+
+
+# MAP Table
+# Filter for SBP, DBP, and MAP values in vital_category
+vitals_bp <- vitals[vital_category %in% c("sbp", "dbp", "map")]
+
+# Reshape the data to spread sbp, dbp, and map into separate columns, using 'mean' to handle duplicates
+vitals_bp <- dcast(vitals_bp, 
+                   hospitalization_id + recorded_dttm ~ vital_category, 
+                   value.var = "vital_value", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+vitals_bp <- vitals_bp[, .(hospitalization_id, recorded_dttm, sbp, dbp, map)]
+setorder(vitals_bp, hospitalization_id, recorded_dttm)
+
+# Define the function to update map if it's NA or an empty string
+fill_map <- function(sbp, dbp, map) {
+  # Check if map is NA or empty
+  if (is.na(map) || map == "") {
+    # Calculate and return the map value using the formula
+    return((1/3 * sbp) + (2/3 * dbp))
+  } else {
+    # If map is already present, return the original map value
+    return(map)
+  }
+}
+
+# Apply the function row-wise using data.table's ':=' to update the map column
+vitals_bp[, map := mapply(fill_map, sbp, dbp, map)]
+
+map_table <- vitals_bp[, .(hospitalization_id, recorded_dttm, map)]
+
+# Merge with hosp_clean_time
+map_table_merge <- merge(hosp_clean_time, map_table, by = "hospitalization_id", all.x = TRUE)
+
+#TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+map_table_merge[, start_time := as.POSIXct(begin_imv) - hours(24)]
+
+# Calculate end_time based on the condition for each hospitalization_id
+map_table_merge[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+map_table_filt <- map_table_merge[recorded_dttm >= start_time & recorded_dttm <= end_time]
+map_table_final <- map_table_filt[, .(hospitalization_id, recorded_dttm, map)]
+
+
+# P/F Table
+#FiO2 Values
+resp_supp_fio2 <- respiratory_support[hospitalization_id %in% hosp_id_rass_clean]
+resp_supp_fio2 <- resp_supp_fio2[, .(hospitalization_id, recorded_dttm, fio2_set)]
+
+#PaO2 Lab Values
+labs_pao2 <- labs[lab_category %in% c("po2_arterial")]
+labs_pao2 <- labs_pao2[, .(hospitalization_id, recorded_dttm, lab_category, lab_value_numeric)]
+setorder(labs_pao2, hospitalization_id, recorded_dttm)
+
+# Reshape the data to spread pao2 into a column, using 'mean' to handle duplicates
+labs_pao2 <- dcast(labs_pao2, 
+                   hospitalization_id + recorded_dttm ~ lab_category, 
+                   value.var = "lab_value_numeric", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+labs_pao2 <- labs_pao2[, .(hospitalization_id, recorded_dttm, po2_arterial)]
+
+
+#Merge fio2 and hosp_clean 
+fio2_hosp_clean <- merge(hosp_clean_time, resp_supp_fio2, by = "hospitalization_id", all.x =TRUE)
+
+#Merge pao2 and hosp_clean
+pao2_hosp_clean <- merge(hosp_clean_time, labs_pao2, by = "hospitalization_id", all.x =TRUE)
+
+#TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+fio2_hosp_clean[, start_time := as.POSIXct(begin_imv) - hours(24), by = hospitalization_id]
+pao2_hosp_clean[, start_time := as.POSIXct(begin_imv) - hours(24), by = hospitalization_id]
+
+# Calculate end_time based on the condition for each hospitalization_id
+fio2_hosp_clean[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+pao2_hosp_clean[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+pao2_hosp_filt <- pao2_hosp_clean[recorded_dttm >= start_time & recorded_dttm <= end_time]
+fio2_hosp_filt <- fio2_hosp_clean[recorded_dttm >= start_time & recorded_dttm <= end_time]
+pao2_hosp_filt <- pao2_hosp_filt[, .(hospitalization_id, recorded_dttm, po2_arterial)]
+fio2_hosp_filt <- fio2_hosp_filt[, .(hospitalization_id, recorded_dttm, fio2_set)]
+
+# Merge
+pao2_fio2_merge <- merge(fio2_hosp_filt, pao2_hosp_filt, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+#Use LOCF to Fill Out fio2 and po2_arterial columns
+pao2_fio2_merge[fio2_set == "", fio2_set := NA]
+pao2_fio2_merge[po2_arterial == "", po2_arterial := NA]
+pao2_fio2_merge[, fio2_set := na.locf(fio2_set, na.rm = FALSE), by = hospitalization_id]
+pao2_fio2_merge[, po2_arterial := na.locf(po2_arterial, na.rm = FALSE), by = hospitalization_id]
+
+#Prepare FiO2 for P/F
+pao2_fio2_merge[, fio2_calc := fifelse(fio2_set <= 1, fio2_set, fio2_set / 100)]
+
+# Calculate P to F Ratio
+pao2_fio2_merge[, p_to_f := po2_arterial / fio2_calc]
+pao2_fio2_sofa <- pao2_fio2_merge[, .(hospitalization_id, recorded_dttm, p_to_f)]
+
+
+# Creatinine Table
+#Creatinine Lab Values
+labs_cr <- labs[lab_category %in% c("creatinine")]
+labs_cr <- labs_cr[, .(hospitalization_id, recorded_dttm, lab_category, lab_value_numeric)]
+setorder(labs_cr, hospitalization_id, recorded_dttm)
+
+# Reshape the data to spread cr into a column, using 'mean' to handle duplicates
+labs_cr <- dcast(labs_cr, 
+                   hospitalization_id + recorded_dttm ~ lab_category, 
+                   value.var = "lab_value_numeric", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+labs_cr <- labs_cr[, .(hospitalization_id, recorded_dttm, creatinine)]
+
+#Merge cr and hosp_clean
+cr_hosp_clean <- merge(hosp_clean_time, labs_cr, by = "hospitalization_id", all.x =TRUE)
+
+#TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+cr_hosp_clean[, start_time := as.POSIXct(begin_imv) - hours(24)]
+
+# Calculate end_time based on the condition for each hospitalization_id
+cr_hosp_clean[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+cr_hosp_filt <- cr_hosp_clean[recorded_dttm >= start_time & recorded_dttm <= end_time]
+cr_hosp_filt <- cr_hosp_filt[, .(hospitalization_id, recorded_dttm, creatinine)]
+
+
+# Total Bilirubin Table
+#Bilirubin Lab Values
+labs_bili <- labs[lab_category %in% c("bilirubin_total")]
+labs_bili <- labs_bili[, .(hospitalization_id, recorded_dttm, lab_category, lab_value_numeric)]
+setorder(labs_bili, hospitalization_id, recorded_dttm)
+
+# Reshape the data to spread bili into a column, using 'mean' to handle duplicates
+labs_bili <- dcast(labs_bili, 
+                   hospitalization_id + recorded_dttm ~ lab_category, 
+                   value.var = "lab_value_numeric", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+labs_bili <- labs_bili[, .(hospitalization_id, recorded_dttm, bilirubin_total)]
+
+#Merge bili and hosp_clean
+bili_hosp_clean <- merge(hosp_clean_time, labs_bili, by = "hospitalization_id", all.x =TRUE)
+
+#TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+bili_hosp_clean[, start_time := as.POSIXct(begin_imv) - hours(24)]
+
+# Calculate end_time based on the condition for each hospitalization_id
+bili_hosp_clean[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+bili_hosp_filt <- bili_hosp_clean[recorded_dttm >= start_time & recorded_dttm <= end_time]
+bili_hosp_filt <- bili_hosp_filt[, .(hospitalization_id, recorded_dttm, bilirubin_total)]
+
+
+# Platelets Table
+#Platelet Lab Values
+labs_platelets <- labs[lab_category %in% c("platelet_count")]
+labs_platelets <- labs_platelets[, .(hospitalization_id, recorded_dttm, lab_category, lab_value_numeric)]
+setorder(labs_platelets, hospitalization_id, recorded_dttm)
+
+# Reshape the data to spread plts into a column, using 'mean' to handle duplicates
+labs_platelets <- dcast(labs_platelets, 
+                   hospitalization_id + recorded_dttm ~ lab_category, 
+                   value.var = "lab_value_numeric", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+labs_platelets <- labs_platelets[, .(hospitalization_id, recorded_dttm, platelet_count)]
+
+#Merge plts and hosp_clean
+platelets_hosp_clean <- merge(hosp_clean_time, labs_platelets, by = "hospitalization_id", all.x =TRUE)
+
+#TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+platelets_hosp_clean[, start_time := as.POSIXct(begin_imv) - hours(24)]
+
+# Calculate end_time based on the condition for each hospitalization_id
+platelets_hosp_clean[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+platelets_hosp_filt <- platelets_hosp_clean[recorded_dttm >= start_time & recorded_dttm <= end_time]
+platelets_hosp_filt <- platelets_hosp_filt[, .(hospitalization_id, recorded_dttm, platelet_count)]
+
+
+# GCS Table
+# Identify GCS_Total Values
+pat_assess_gcs <- patient_assessments[assessment_category == "gcs_total"]
+setorder(pat_assess_gcs, hospitalization_id, recorded_dttm)
+
+# Reshape the data to spread GCS into a column, using 'mean' to handle duplicates
+pat_assess_gcs <- dcast(pat_assess_gcs, 
+                   hospitalization_id + recorded_dttm ~ assessment_category, 
+                   value.var = "numerical_value", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+pat_assess_gcs <- pat_assess_gcs[, .(hospitalization_id, recorded_dttm, gcs_total)]
+
+# Merge Hosp Time Clean with RASS
+gcs_hosp_clean <- merge(hosp_time_clean, pat_assess_gcs, by = "hospitalization_id", all.x = TRUE)
+
+#TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+gcs_hosp_clean[, start_time := as.POSIXct(begin_imv) - hours(24)]
+
+# Calculate end_time based on the condition for each hospitalization_id
+gcs_hosp_clean[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+gcs_hosp_filt <- gcs_hosp_clean[recorded_dttm >= start_time & recorded_dttm <= end_time]
+gcs_hosp_filt <- gcs_hosp_filt[, .(hospitalization_id, recorded_dttm, gcs_total)]
+
+
+# SOFA Meds
+# Filter only for vasopressor sofa meds
+meds_sofa <- meds[med_category %in% c("dopamine", "dobutamine", "epinephrine", "norepineprhine")]
+meds_sofa <- meds_sofa[, .(hospitalization_id, admin_dttm, med_category, med_dose, med_dose_unit)]
+setnames(meds_sofa, "admin_dttm", "recorded_dttm")
+setorder(meds_sofa, hospitalization_id, recorded_dttm)
+
+# Merge Hosp Time Clean with SOFA Meds
+meds_sofa_hosp_clean <- merge(hosp_time_clean, meds_sofa, by = "hospitalization_id", all.x = TRUE)
+
+#TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+meds_sofa_hosp_clean[, start_time := as.POSIXct(begin_imv) - hours(24)]
+
+# Calculate end_time based on the condition for each hospitalization_id
+meds_sofa_hosp_clean[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+meds_sofa_hosp_filt <- meds_sofa_hosp_clean[recorded_dttm >= start_time & recorded_dttm <= end_time]
+meds_sofa_hosp_filt <- meds_sofa_hosp_filt[, .(hospitalization_id, recorded_dttm, med_category, med_dose)]
+
+
+# ******
+# STEP 3: MERGER of data tables to form final SOFA Table
+# *****
+
+# First Merge Timeline with P/F
+sofa_table_one <- merge(hosp_clean_timeline, pao2_fio2_sofa, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+# Second Merge with Platelets
+sofa_table_two <- merge(sofa_table_one, platelets_hosp_filt, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+# Third Merge with GCS
+sofa_table_three <- merge(sofa_table_two, gcs_hosp_filt, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+# Fourth Merge with Bilirubin
+sofa_table_four <- merge(sofa_table_three, bili_hosp_filt, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+# Fifth Merge with Creatinine
+sofa_table_five <- merge(sofa_table_four, cr_hosp_filt, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+# Sixth Merge with MAP
+sofa_table_six <- merge(sofa_table_five, map_table_final, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+# Final Merge with SOFA Meds
+sofa_table_final <- merge(sofa_table_six, meds_sofa_hosp_filt, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+
+# Fill in Blanks and Use LOCF to Fill Out the Table
+cols_to_update <- c("p_to_f", "platelet_count", "gcs_total", "bilirubin_total", "creatinine", "map", "med_category", "med_dose")
+sofa_table_final[, (cols_to_update) := lapply(.SD, function(x) fifelse(x == "", NA, x)), .SDcols = cols_to_update]
+
+sofa_table <- sofa_table_final[, (cols_to_update) := lapply(.SD, function(x) na.locf(x, na.rm = FALSE)), 
+                 by = hospitalization_id, .SDcols = cols_to_update]
+
+
+# STEP 4: SOFA SCORE ASSEMBLY
+# Plan to choose maximum in each of the SOFA categories for the 24 hours leading up to mechanical ventilation and use that to calculate total sofa
+
+# Pulm SOFA
+sofa_table[, pulm_sofa := fcase(
+  p_to_f >= 400, 0,
+  p_to_f >= 300 & p_to_f < 400, 1,
+  p_to_f >= 200 & p_to_f < 300, 2,
+  p_to_f >= 100 & p_to_f < 200, 3,
+  p_to_f < 100, 4,
+  is.na(p_to_f), 0  # Assign 0 if p_to_f is NA
+)]
+
+# Heme SOFA
+sofa_table[, heme_sofa := fcase(
+  platelet_count >= 150, 0,
+  platelet_count >= 100 & platelet_count < 150, 1,
+  platelet_count >= 50 & platelet_count < 100, 2,
+  platelet_count >= 20 & platelet_count < 50, 3,
+  platelet_count < 20, 4,
+  is.na(platelet_count), 0  # Assign 0 if platelet_count is NA
+)]
+
+# Neuro SOFA
+sofa_table[, neuro_sofa := fcase(
+  gcs_total == 15, 0,
+  gcs_total >= 13 & gcs_total < 15, 1,
+  gcs_total >= 10 & gcs_total < 13, 2,
+  gcs_total >= 6 & gcs_total < 10, 3,
+  gcs_total < 6, 4,
+  is.na(gcs_total), 0  # Assign 0 if gcs_total is NA
+)]
+
+# GI SOFA
+sofa_table[, gi_sofa := fcase(
+  bilirubin_total < 1.2, 0,
+  bilirubin_total >= 1.2 & bilirubin_total < 2.0, 1,
+  bilirubin_total >= 2.0 & bilirubin_total < 6.0, 2,
+  bilirubin_total >= 6.0 & bilirubin_total < 12.0, 3,
+  bilirubin_total >= 12, 4,
+  is.na(bilirubin_total), 0  # Assign 0 if bilirubin_total is NA
+)]
+
+# Renal SOFA
+sofa_table[, renal_sofa := fcase(
+  creatinine < 1.2, 0,
+  creatinine >= 1.2 & creatinine < 2.0, 1,
+  creatinine >= 2.0 & creatinine < 3.5, 2,
+  creatinine >= 3.5 & creatinine < 5.0, 3,
+  creatinine >= 5.0, 4,
+  is.na(creatinine), 0  # Assign 0 if creatinine is NA
+)]
+
+# Card SOFA
+sofa_table[, card_sofa := fcase(
+  map > 70 & is.na(med_category), 0,
+  map < 70 & is.na(med_category), 1,
+  med_category == "dopamine" & med_dose <= 5, 2,
+  med_category == "dobutamine", 2,
+  med_category == "dopamine" & med_dose > 5, 3,
+  med_category == "epinephrine" & med_dose <= 0.1, 3,
+  med_category == "norepinephrine" & med_dose <= 0.1, 3,
+  med_category == "dopamine" & med_dose >= 15, 4,
+  med_category == "epinephrine" & med_dose > 0.1, 4,
+  med_category == "norepinephrine" & med_dose > 0.1, 4,
+  is.na(map) | is.na(med_category) | is.na(med_dose), 0  # Assign 0 if any relevant value is NA
+)]
+
+
+# STEP 5: List of SOFA score columns for which to calculate maximum value
+sofa_cols <- c("pulm_sofa", "heme_sofa", "neuro_sofa", "gi_sofa", "renal_sofa", "card_sofa")
+
+
+# STEP 6: Create a new table with the maximum SOFA scores per hospitalization_id
+max_sofa_table <- sofa_table[, lapply(.SD, max, na.rm = TRUE), by = hospitalization_id, .SDcols = sofa_cols]
+
+# **** THERE ARE EXTRA HOSPITALIZATION_IDS IN HERE ****
+
+# STEP 7: Calculate total SOFA score
+max_sofa_table[, total_sofa := pulm_sofa + heme_sofa + neuro_sofa + gi_sofa + renal_sofa + card_sofa]
+
+sofa_final <- max_sofa_table[, .(hospitalization_id, total_sofa)] 
+
+
+```
+
+
+# PART TWELVE: Demographics
+```{R}
+
+# Age at Admission
+
+
+# Clean version of Patient Table
+patient_clean <- patient[patient_id %in% pat_rass_id_clean]
+
+# Merge Patient and hosp_rass_clean
+
+patient_merged <- merge(hosp_rass_clean, patient_clean, by = "patient_id", all.x = TRUE)
+patient_merged <- patient_merged[, .(patient_id, hospitalization_id, race_category, ethnicity_category, sex_category, language_name)]
+
+
+# Summary Statistics of Cohort
+summary_stats <- patient_merged[, .(
+  race_category_counts = .N, by = race_category,
+  ethnicity_category_counts = .N, by = ethnicity_category,
+  sex_category_counts = .N, by = sex_category,
+  language_name_counts = .N, by = language_name
+)]
+summary_stats_race <- patient_merged[, .N, by = race_category][order(-N)]
+summary_stats_ethnicity <- patient_merged[, .N, by = ethnicity_category][order(-N)]
+summary_stats_sex <- patient_merged[, .N, by = sex_category][order(-N)]
+summary_stats_language <- patient_merged[, .N, by = language_name][order(-N)]
+
+hispanic_english_count <- patient_merged[ethnicity_category == "Hispanic" & language_name == "English", .N]
+hispanic_spanish_count <- patient_merged[ethnicity_category == "Hispanic" & language_name == "Spanish", .N]
+hispanic_declined_count <- patient_merged[ethnicity_category == "Hispanic" & language_name == "Patient Declined", .N]
+
+black_english_count <- patient_merged[race_category == "Black or African American" & language_name == "English", .N]
+black_unknown_count <- patient_merged[race_category == "Black or African American" & language_name == "Unknown", .N]
+black_blank_count <- patient_merged[race_category == "Black or African American" & language_name == "", .N]
+black_declined_count <- patient_merged[race_category == "Black or African American" & language_name == "Patient Declined", .N]
+
+asian_english_count <- patient_merged[race_category == "Asian" & language_name == "English", .N]
+asian_unknown_count <- patient_merged[race_category == "Asian" & language_name == "Unknown", .N]
+asian_blank_count <- patient_merged[race_category == "Asian" & language_name == "", .N]
+asian_declined_count <- patient_merged[race_category == "Asian" & language_name == "Patient Declined", .N]
+
+
+```
+
+
+# PART THIRTEEN: Assembly of Final Analytic Table
+
+```{R}
+
+# Demographics
+
+# BMI
+
+# SOFA
+
+# Paralyzed
+
+# Deep Sedation Time
+
+
+
+```
+
+
+# PART FOURTEEN: Analysis
+
+```{R}
+
+
+
+```
+
+
+
+```{R}
+
+
+# **** OLD CODE / NOTES *****
+
+
+# Load the data.table package
+library(data.table)
+
+# Add directory up here**
+
+# Load Raw CLIF Files and filter only for needed variables/columns
+patient <- fread("/share/projects/data/circe/v20240331/clif/patient.csv.gz", select = c("patient_id", "race_category", "ethnicity_category", "sex_category", "death_dttm", "language_name"))
+hospitalization <- fread("/share/projects/data/circe/v20240331/clif/hospitalization.csv.gz", select = c("patient_id", "hospitalization_id", "admission_dttm", "discharge_dttm", "age_at_admission", "discharge_category")) 
+adt <- fread("/share/projects/data/circe/v20240331/clif/adt.csv.gz", select = c("hospitalization_id", "hospital_id", "in_dttm", "out_dttm", "location_category"))
+vitals <- fread("/share/projects/data/circe/v20240331/clif/vitals.csv.gz", select = c("hospitalization_id", "recorded_dttm", "vital_category", "vital_value"))
+labs <- fread("/share/projects/data/circe/v20240331/clif/labs.csv.gz", select = c("hospitalization_id", "lab_collect_dttm", "lab_order_category", "lab_category", "lab_value", "lab_value_numeric", "reference_unit"))
+patient_assessments <- fread("/share/projects/data/circe/v20240331/clif/patient_assessments.csv.gz", select = c("hospitalization_id", "recorded_dttm", "assessment_category", "assessment_group", "numerical_value", "categorical_value", "text_value"))
+respiratory_support <- fread("/share/projects/data/circe/v20240331/clif/respiratory_support.csv.gz", select = c("hospitalization_id", "recorded_dttm", "device_category", "mode_category", "tracheostomy"))
+med_admin_continuous <- fread("/share/projects/data/circe/v20240331/clif/med_admin_continuous.csv.gz", select = c("hospitalization_id", "admin_dttm", "med_group", "mar_action_name"))
+
+
+# Filter hospitalizations, assessments, vitals, and labs - can use join, merge function at this point
+hospitalization <- hospitalization[hospitalization_id %in% hosp_id_imv]
+adt <- adt[hospitalization_id %in% hosp_id_imv]
+vitals <- vitals[hospitalization_id %in% hosp_id_imv]
+labs <- labs[hospitalization_id %in% hosp_id_imv]
+patient_assessments <- patient_assessments[hospitalization_id %in% hosp_id_imv]
+respiratory_support <- respiratory_support[hospitalization_id %in% hosp_id_imv]
+med_admin_continuous <- med_admin_continuous[hospitalization_id %in% hosp_id_imv]
+
+
+# ######################################################################## BREAK #############
+# RUN LENGTH ENCODING (RLE) - specific function for R that deals with timestamp data
+# shift function in data.table (used to be called lag & lead) 
+# seq function - can generate a sequence with start and stop periods and period of time
+# locf - last one carried forward function - will great RASS
+
+```
+
