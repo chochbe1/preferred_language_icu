@@ -450,43 +450,35 @@ patient_assessments <- fread("/share/projects/data/circe/v20240331/clif/patient_
                              select = c("hospitalization_id", "recorded_dttm", "assessment_category", 
                                         "assessment_group", "numerical_value", "categorical_value", "text_value"))[hospitalization_id %in% hosp_time_clean_id]
 
+patient_assessments %>% distinct(hospitalization_id)
+
 
 # STEP 2: Form RASS Specific Patient Assessment Table
 pat_assess_rass <- patient_assessments[assessment_category == "RASS"]
 setorder(pat_assess_rass, hospitalization_id, recorded_dttm)
 
 
-# STEP 3: Merge Hosp Time Clean with RASS
-hosp_time_rass <- merge(hosp_time_clean, pat_assess_rass, by = "hospitalization_id", all.x = TRUE)
+pat_assess_rass %>% distinct(hospitalization_id)
 
 
-# STEP 4: Identify earliest RASS time for each hospitalization
-# Subtract 2 hours from begin_imv and apply the filters
-hosp_time_rass_filt <- hosp_time_rass[recorded_dttm > (begin_imv - hours(2)) & recorded_dttm < end_imv]
-
-# Form new table with earliest RASS times
-hosp_first_rass <- hosp_time_rass_filt[, .(first_rass_dttm = min(recorded_dttm)), by = hospitalization_id]
-
-# Merge first RASS time with Hosp Time Clean to form Current Timeline
-hosp_rass_timeline <- merge(hosp_time_clean, hosp_first_rass, by = "hospitalization_id", all.x = TRUE)
+# STEP 3: Identify first RASS Timepoint
+pat_first_rass <- pat_assess_rass[, .(first_rass_dttm = min(recorded_dttm)), by = hospitalization_id]
 
 
-# STEP 5: Calculate time between IMV and first RASS and flag those with greater than 8 hours between
-# Calculate Time Between First RASS and Begin IMV
-hosp_rass_timeline[, time_to_first_rass := as.numeric(difftime(first_rass_dttm, begin_imv, units = "hours"))]
+# STEP 4: Merge Hosp Time Clean with RASS
+hosp_time_rass <- merge(hosp_time_clean, pat_first_rass, by = "hospitalization_id", all = TRUE)
 
-# Flag Those with 8 hour gaps 
-hosp_rass_timeline[, flag_greater_than_8h := time_to_first_rass > 8]
 
-num_rass_missing <- hosp_rass_timeline[flag_greater_than_8h == TRUE, .N]
+# STEP 5: Calculate time between first RASS and beginning mechanical ventilation
+hosp_time_rass[, time_to_first_rass := as.numeric(difftime(first_rass_dttm, begin_imv, units = "hours"))]
 
-# STEP 6: Remove All Hospitalizations with Delayed RASS Times
-hosp_rass_clean <- hosp_rass_timeline[flag_greater_than_8h == FALSE | is.na(flag_greater_than_8h) | flag_greater_than_8h == ""]
-hosp_rass_clean[, c("first_rass_dttm", "time_to_first_rass", "flag_greater_than_8h") := NULL]
 
+# STEP 6: Filter Out Hospitalizations with >8 hours or more gap between begin IMV and first RASS as well as those with no RASS values
+hosp_rass_clean <- hosp_time_rass[!is.na(time_to_first_rass) & time_to_first_rass < 8]
 
 hosp_id_rass_clean <- unique(hosp_rass_clean$hospitalization_id)
 pat_id_rass_clean <- unique(hosp_rass_clean$patient_id)
+
 
 ```
 
