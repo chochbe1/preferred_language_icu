@@ -44,7 +44,7 @@ Adults with documented IMV periods >24 hours. There are no date constraints.
 under construction
 
 ## Detailed Instructions
-1. Run code
+1. Run [CODE](https://github.com/weissman-lab/preferred_language_icu/tree/main/CODE)
 2. Deposit results:
 
 Please deposit your entire result_[SITE_NAME] folder in this [box folder](https://uchicago.box.com/s/fcaum7o8v59n9c1vy7xnboqy2in4t4ju)
