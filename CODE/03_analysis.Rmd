@@ -1,0 +1,151 @@
+
+# Setup Step: Setup libraries
+```{r}
+
+# Install Packages
+
+packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr")
+install_if_missing <- function(package) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package, dependencies = TRUE)
+    library(package, character.only = TRUE)
+  }
+}
+ 
+sapply(packages, install_if_missing)
+
+# Load necessary libraries
+library(data.table)
+library(dplyr)
+library(zoo)  # for na.locf function
+library(lubridate)
+library(tidyr)
+
+```
+
+```{r}
+
+# Define the Directory Where Existing CLIF Tables are Located
+data_dir <- "/share/projects/data/circe/v20240931a/clif/" # Add your directory information here
+
+# Define the Directory where Intermediate and Final Tables will be saved
+output_dir <- "/share/projects/data/circe/v20240931a/clif/sedation_project/" # Add your output information here
+
+# Add your File Type here:
+
+
+# Add your institution here
+Institution <- "Penn" # Add your institution here
+
+# Upload Part One Data Table
+part_two_data <- fread(paste0(output_dir, "analytic_table.csv.gz"))
+
+
+# Identify reference points for model
+part_two_data$ethnicity <- relevel(as.factor(part_two_data$ethnicity), ref = "Non-Hispanic")
+part_two_data$race <- relevel(as.factor(part_two_data$race), ref = "White")
+part_two_data$sex <- relevel(as.factor(part_two_data$sex), ref = "Male")
+part_two_data$hospital_ids <- relevel(as.factor(part_two_data$hospital_ids), ref = "HUP")
+part_two_data$primary_sedative <- relevel(as.factor(part_two_data$primary_sedative), ref = "propofol")
+
+
+# Intersection group
+part_two_data$intersection_group <- interaction(part_two_data$race, part_two_data$ethnicity, drop = TRUE)
+part_two_data$intersection_group<- relevel(as.factor(part_two_data$intersection_group), ref = "White.Non-Hispanic")
+
+
+
+# Fit the model
+model <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_ids + primary_sedative + intersection_group, data = part_two_data)
+
+summary(model)
+
+
+
+
+# Fit the model
+model_two <- lm(time_to_first_sbt ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_ids + primary_sedative, data = part_two_data)
+
+summary(model_two)
+
+
+
+
+# Model Four
+
+model_four <- lm(total_imv_time ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_ids + primary_sedative, data = part_two_data)
+summary(model_four)
+
+
+
+# Model of Primary Sedative
+library(nnet)
+
+# Fit the multinomial logistic regression model
+model_five <- multinom(primary_sedative ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_ids, 
+                  data = part_two_data)
+
+# Summary of the model
+summary(model_five)
+
+
+```
+
+
+```{r}
+
+
+# Risk of Prolonged Mechanical Ventilation
+
+# Load the survival package
+library(survival)
+
+# Create a binary variable for prolonged mechanical ventilation
+part_two_data[, prolonged_mv := ifelse(total_imv_time > 504, 1, 0)]
+
+# Fit the Cox proportional hazards model
+cox_model <- coxph(Surv(total_imv_time, prolonged_mv) ~ language + age + sex + race + ethnicity + primary_sedative + bmi + paralyzed + total_sofa + hospital_ids + intersection_group, data = part_two_data)
+
+# Summarize the model to view the hazard ratios
+summary(cox_model)
+
+
+# Calculate time to trach
+
+
+
+```
+
+
+```{r}
+
+
+# Subset data to only include Hispanic patients
+hispanic_data <- part_two_data[ethnicity == "Hispanic"]
+hispanic_data$race <- relevel(as.factor(hispanic_data$race), ref = "White")
+hispanic_data$sex <- relevel(as.factor(hispanic_data$sex), ref = "Male")
+hispanic_data$hospital_ids <- relevel(as.factor(hispanic_data$hospital_ids), ref = "HUP")
+hispanic_data$primary_sedative <- relevel(as.factor(hispanic_data$primary_sedative), ref = "propofol")
+
+# Fit a linear model for Hispanic patients, excluding ethnicity
+model_hispanic <- lm(percent_deep_sedation ~ language + age + sex + race + bmi + paralyzed + total_sofa + hospital_ids + primary_sedative, data = hispanic_data)
+
+# Summarize the model
+summary(model_hispanic)
+
+
+```
+
+
+```{r}
+
+part_two_data_filtered <- part_two_data[race != "Unknown" & ethnicity != "Unknown"]
+
+
+# Fit the model
+model_filtered <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_ids + primary_sedative, data = part_two_data_filtered)
+
+summary(model_filtered)
+
+
+```

@@ -1,0 +1,438 @@
+
+# Setup Step: Setup libraries
+```{r}
+# Install Packages
+
+packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr")
+install_if_missing <- function(package) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package, dependencies = TRUE)
+    library(package, character.only = TRUE)
+  }
+}
+ 
+sapply(packages, install_if_missing)
+
+# Load necessary libraries
+library(data.table)
+library(dplyr)
+library(zoo)  # for na.locf function
+library(lubridate)
+library(tidyr)
+
+```
+
+# PART ONE:
+# ***Define the data directory for the rest of the script
+# ***Upload Raw Respiratory, Hospitalization, and Patient Tables
+# ***Initial identification and cleaning of IMV patients and tracheostomy patients
+
+```{r}
+# Define the Directory Where Existing CLIF Tables are Located
+data_dir <- "/share/projects/data/circe/v20240931a/clif/" # Add your directory information here
+
+# Define the Directory where Intermediate and Final Tables will be saved
+output_dir <- "/share/projects/data/circe/v20240931a/clif/sedation_project/" # Add your output information here
+
+# Add your File Type here:
+
+
+# Add your institution here
+Institution <- "Penn"
+
+
+# STEP 1: Load Raw CLIF Respiratory Support, Hospitalization, and Patient Tables
+respiratory_support <- fread(paste0(data_dir, "respiratory_support.csv.gz"), select = c("hospitalization_id", "recorded_dttm", "device_category", "tracheostomy"))
+hospitalization <- fread(paste0(data_dir, "hospitalization.csv.gz"), select = c("patient_id", "hospitalization_id", "admission_dttm", "discharge_dttm", "age_at_admission", "discharge_category"))
+hospitalization <- unique(hospitalization, by = "hospitalization_id")
+patient <- fread(paste0(data_dir,"patient.csv.gz"))
+
+
+# STEP 2: Identifying the tracheostomy patients
+# Identify hospitalization_ids that have tracheostomy at some point during their hospitalization and earliest timestamp for this finding
+trach_resp <- respiratory_support[tracheostomy == "1"]
+trach_dttm_table <- trach_resp[, .(trach_dttm = min(recorded_dttm)), by = hospitalization_id]
+hosp_id_trach <- unique(trach_resp$hospitalization_id)
+
+# Identify hospital_ids that have "trach collar" device at any point in hospitalization and corresponding earliest timestamp
+trach_collar_resp <- respiratory_support[device_category == "Trach Collar"]
+trach_collar_dttm_table <- trach_collar_resp[, .(trach_collar_dttm = min(recorded_dttm)), by = hospitalization_id]
+hosp_id_trach_collar <- unique(trach_collar_resp$hospitalization_id)
+
+# Merge the Two Trach Hospital DTTM Tables
+trach_times <- merge(trach_dttm_table, trach_collar_dttm_table, by = "hospitalization_id", , all = TRUE)
+trach_times[, first_trach_dttm := pmin(trach_dttm, trach_collar_dttm, na.rm = TRUE)]
+
+# Hospitalization IDs with trach
+hosp_id_trach_total <- unique(trach_times$hospitalization_id)
+
+
+# STEP 3: Identify earliest "IMV" for each hospitalization_id
+# Identify earliest "IMV" for each hospitalization_id
+resp_supp_imv <- respiratory_support[device_category == "IMV"]
+imv_earliest <- resp_supp_imv[device_category == "IMV", .(
+  first_imv_dttm = min(recorded_dttm)
+), by = hospitalization_id]
+
+# Hospitalization IDs with IMV
+hosp_id_imv <- unique(resp_supp_imv$hospitalization_id)
+
+
+# STEP 4: Merge Trach Timeline with Earliest IMV Time to create expanded timeline for trach patients
+imv_trach_timeline <- merge(trach_times, imv_earliest, by = "hospitalization_id", , all = TRUE)
+imv_trach_timeline <- imv_trach_timeline[, .(hospitalization_id, first_trach_dttm, first_imv_dttm)]
+imv_trach_id <- unique(imv_trach_timeline$hospitalization_id)
+
+
+# STEP 5: Form Specific Patient and Hospitalization Tables for identified IDs and then merge them together
+hosp_imv_trach <- hospitalization[hospitalization_id %in% imv_trach_id]
+hosp_imv_trach <- hosp_imv_trach[, .(patient_id, hospitalization_id, admission_dttm, discharge_dttm, discharge_category, age_at_admission)]
+pat_id_imv_trach <- unique(hosp_imv_trach$patient_id)
+pat_imv_trach <- patient[patient_id %in% pat_id_imv_trach]
+pat_hosp_imv_trach <- merge(hosp_imv_trach, pat_imv_trach, by = "patient_id", all.x = TRUE)
+
+
+# STEP 6: Merge Limited Patient Hospitalization Table with the Trach Timeline from Step 4 to form Admission Timeline
+admission_timeline <- merge(pat_hosp_imv_trach, imv_trach_timeline, by = "hospitalization_id", all.x = TRUE)
+admission_timeline <- admission_timeline[, .(patient_id, hospitalization_id, admission_dttm, discharge_dttm, first_imv_dttm, first_trach_dttm, death_dttm, age_at_admission, discharge_category)]
+setorder(admission_timeline, patient_id, admission_dttm)
+
+# STEP 7: Filter Out any Patient Younger than 18 at admission
+admission_timeline <- admission_timeline[age_at_admission >= 18]
+
+
+# STEP 8: At the patient_id level, filter out any Tracheostomy Patients who have no mechanical ventilation values in any of their hospitalizations
+# Flag patient IDs with tracheostomy
+admission_timeline[, trach_flag := any(!is.na(first_trach_dttm)), by = patient_id]
+
+# For each patient_id check if all first_imv_dttm values are NA
+admission_timeline[, all_imv_na := all(is.na(first_imv_dttm)), by = patient_id]
+
+# Patients with Trach but no IMV values 
+patients_trach_no_imv <- admission_timeline[trach_flag == TRUE & all_imv_na == TRUE, unique(patient_id)]
+
+# Remove the patient_ids with trach and no IMV
+admission_timeline_filtered <- admission_timeline[!(patient_id %in% patients_trach_no_imv)]
+setorder(admission_timeline_filtered, patient_id, admission_dttm)
+
+# Total Hospitalization_IDs in admission_timeline_filtered
+admission_timeline_hosp_id <- unique(admission_timeline_filtered$hospitalization_id)
+
+```
+
+
+
+# PART TWO: Thorough Cleaning of All Identified Admissions
+# ***Separate out patients with one hospitalization vs those with multiple admissions to determine accurate timeline
+# ***Focus on cleaning the trach patients to remove as many unidentified tracheostomy episodes as possible
+
+```{R}
+# STEP 1: Identify patients with only one hospitalization
+single_hospitalizations <- admission_timeline_filtered[, .N, by = patient_id][N == 1]
+single_pat_id <- unique(single_hospitalizations$patient_id)
+
+# Filter the main table to only include patients with single hospitalizations
+single_hosp_data <- admission_timeline_filtered[patient_id %in% single_pat_id]
+single_hosp_data[, all_imv_na := NULL]
+single_hosp_id <- unique(single_hosp_data$hospitalization_id)
+
+
+# STEP 2: Identify Single Admissions Trach Patients
+# Filtering single hospital admissions for those with a True trach flag
+single_hosp_id_trach <- single_hosp_data[trach_flag == TRUE, unique(hospitalization_id)]
+single_trach_data <- single_hosp_data[hospitalization_id %in% single_hosp_id_trach]
+single_trach_final <- single_trach_data[, .(hospitalization_id, admission_dttm, discharge_dttm, first_imv_dttm, first_trach_dttm)]
+
+
+# STEP 3: Identify patients with repeat hospitalizations
+# Filter the admission timeline table to only include patients with repeat hospitalizations
+repeat_hosp_id <- setdiff(admission_timeline_hosp_id, single_hosp_id)
+repeat_hosp_data <- admission_timeline_filtered[hospitalization_id %in% repeat_hosp_id]
+repeat_hosp_data[, all_imv_na := NULL]
+setorder(repeat_hosp_data, patient_id, admission_dttm)
+
+
+# STEP 4: Identify Repeat Admission Trach Patients
+repeat_hosp_id_trach <- repeat_hosp_data[trach_flag == TRUE, unique(hospitalization_id)]
+
+
+# STEP 5: Identify repeat admission trach patients who have missing first_trach_dttm values to determine if those missing values should be filled in with previously identified trach times
+
+# Identify Patients with Flag Trach True and empty "first_trach_dttm" values. These are missing data patients and will be processed differently than complete patients
+repeat_hosp_data[, trach_info_missing := ifelse(trach_flag == TRUE & is.na(first_trach_dttm), TRUE, FALSE)]
+pat_id_trach_missing <- repeat_hosp_data[trach_info_missing == TRUE, unique(patient_id)]
+
+# Select only the Patients with Missing Trach Information
+repeat_hosp_trach_missing <- repeat_hosp_data[patient_id %in% pat_id_trach_missing]
+setorder(repeat_hosp_trach_missing, patient_id, admission_dttm)
+
+
+# STEP 6: Cleaning of the "missing" first_trach_dttm patients
+# In this step, if first_trach_dttm info is missing from the hospitalization and the first_trach_dttm date from the previous hospitalization is within 60 days of the current admission_dttm, we will update the first_trach_dttm for that hospitalization to the value from the previous hospitalization. This will help filter out post-trach data later on.
+
+# For each patient, check if first_trach_dttm is missing and update it with the previous hospitalization's trach date if within 60 days
+repeat_hosp_trach_missing[, prev_trach_dttm := shift(first_trach_dttm, type = "lag"), by = patient_id]
+repeat_hosp_trach_missing[, days_since_last_admission := as.numeric(difftime(admission_dttm, prev_trach_dttm, units = "days"))]
+repeat_hosp_trach_missing[, fill_trach := (is.na(first_trach_dttm) & !is.na(prev_trach_dttm) & days_since_last_admission <= 60)]
+
+# Clean First Trach DTTM Info for repeat Trach Patients with Missing Trach Info
+repeat_hosp_trach_missing[fill_trach == TRUE, first_trach_dttm := prev_trach_dttm]
+repeat_hosp_trach_missing <- repeat_hosp_trach_missing[, .(hospitalization_id, admission_dttm, discharge_dttm, first_imv_dttm, first_trach_dttm)]
+repeat_hosp_id_trach_missing <- unique(repeat_hosp_trach_missing$hospitalization_id)
+
+
+# STEP 7: Identify Repeat Hospitalization patients with tracheostomy and no missing data
+repeat_hosp_id_trach_complete <- setdiff(repeat_hosp_id_trach, repeat_hosp_id_trach_missing)
+repeat_hosp_trach_complete <- repeat_hosp_data[hospitalization_id %in% repeat_hosp_id_trach_complete]
+repeat_hosp_trach_complete <- repeat_hosp_trach_complete[, .(hospitalization_id, admission_dttm, discharge_dttm, first_imv_dttm, first_trach_dttm)]
+setorder(repeat_hosp_trach_complete, hospitalization_id, admission_dttm)
+
+
+# STEP 8: Merge Repeat Trach Complete and Repeat Trach Missing Data
+repeat_trach_final <- rbind(repeat_hosp_trach_complete, repeat_hosp_trach_missing, use.names = TRUE, fill = TRUE)
+
+
+# STEP 9: Merge Repeat and Single Trach Hospitalization Tables
+trach_final <- rbind(repeat_trach_final, single_trach_final, use.names = TRUE, fill = TRUE)
+
+
+# STEP 10: Filter Out Non-IMV Hospitalizations
+trach_final_imv <- trach_final[!is.na(first_imv_dttm)]
+trach_final_imv_id <- unique(trach_final_imv$hospitalization_id)
+
+```
+
+
+
+# PART THREE: Develop Tables for Non-Trach Patients with IMV hospitalizations for IMV Run Calculations in PART FIVE
+# ***Combine repeat and single admissions non-trach patients and merge with respiratory_support & hospitalization
+```{R}
+# STEP 1: Identify Non-Trach Patients with Single Admissions
+single_hosp_id_ett <- setdiff(single_hosp_id, single_hosp_id_trach)
+
+
+# STEP 2: Identify Non-Trach Patients with Repeat Admissions
+repeat_hosp_id_ett <- setdiff(repeat_hosp_id, repeat_hosp_id_trach)
+
+
+# STEP 3: Merge Single and Repeat Hospitalization IDs
+hosp_id_ett <- c(single_hosp_id_ett, repeat_hosp_id_ett)
+
+
+# STEP 4: Bring in Specific Respiratory Support and Hospitalization Tables for These IDs
+respiratory_support_ett <- respiratory_support[hospitalization_id %in% hosp_id_ett]
+hospitalization_ett <- hospitalization[hospitalization_id %in% hosp_id_ett]
+hospitalization_ett <- unique(hospitalization_ett, by = "hospitalization_id")
+
+
+# STEP 5: Merge Respiratory Support and Hospitalization
+resp_hosp_ett <- merge(hospitalization_ett, respiratory_support_ett, by = "hospitalization_id", all = TRUE)
+resp_hosp_ett <- resp_hosp_ett[, .(hospitalization_id, recorded_dttm, device_category, admission_dttm, discharge_dttm)]
+
+```
+
+
+# PART FOUR: Develop Tables for Trach Patients with IMV hospitalizations for IMV Run Calculations in PART FIVE
+# ***Merge previously cleaned trach hospitalizations with respiratory_support and hospitalization tables
+# ***Filter out any time periods after initiation of tracheostomy as identified earlier
+```{R}
+# STEP 1: Create Trach Respiratory Support Table
+respiratory_support_trach <- respiratory_support[hospitalization_id %in% trach_final_imv_id]
+
+
+# STEP 2: Convert any blank values in device_category to "NA" and then perform LOCF to fill device_category column
+respiratory_support_trach[device_category == "", device_category := NA]
+respiratory_support_trach[, device_category := na.locf(device_category, na.rm = FALSE), by = hospitalization_id]
+
+
+# STEP 3: Merge Respiratory Support Trach Table with Trach Final IMV Table from PART TWO
+resp_trach_imv <- merge(respiratory_support_trach, trach_final_imv, by = "hospitalization_id", all.x = TRUE)
+resp_trach_imv[, c("tracheostomy", "first_imv_dttm") := NULL]
+
+
+# STEP 4: # Filter out rows where recorded_dttm is before trach_dttm and return table to original columns
+resp_pre_trach_imv <- resp_trach_imv[recorded_dttm < first_trach_dttm]
+
+
+# STEP 5: Identify hosp_ids where at least one IMV is documented
+valid_hosp_ids <- resp_pre_trach_imv[device_category == "IMV", unique(hospitalization_id)]
+
+
+# STEP 6: Select only hospitalization_ids without "IMV"
+resp_pre_trach_imv_final <- resp_pre_trach_imv[hospitalization_id %in% valid_hosp_ids]
+
+
+# Get unique hospitalization_ids in resp_pre_trach_imv_final
+resp_pre_trach_imv_id <- unique(resp_pre_trach_imv_final$hospitalization_id)
+
+```
+
+
+
+# PART FIVE: Develop IMV Run Tables
+# ***Merge Cleaned Trach and Non-Trach IMV Information from previous parts
+# ***Use LOCF and RLEID logic to fill out tables and identify runs of mechanical ventilation
+# ***Aggregating IMV runs within 24 hours of one another
+# ***Selecting only for runs over 24 hours
+```{R}
+# STEP 1: Establish Timeline Information (admission time, discharge time, etc) for both trach and non-trach patients and merge them together
+hospitalization_ett_time <- hospitalization_ett[, .(hospitalization_id, admission_dttm, discharge_dttm)]
+trach_imv_time <- trach_final_imv[hospitalization_id %in% resp_pre_trach_imv_id, .(hospitalization_id, admission_dttm, discharge_dttm)]
+timeline_info <- union(hospitalization_ett_time, trach_imv_time)
+
+
+# STEP 2: Merge Cleaned Trach and Non-Trach Respiratory Tables
+respiratory_support_imv <- rbind(resp_pre_trach_imv_final, resp_hosp_ett, use.names = TRUE, fill = TRUE)
+setorder(respiratory_support_imv, hospitalization_id, recorded_dttm)
+
+
+# STEP 3: Convert any blank values in device_category to "NA" and then perform LOCF to fill device_category column
+respiratory_support_imv[device_category == "", device_category := NA]
+respiratory_support_imv[, device_category := na.locf(device_category, na.rm = FALSE), by = hospitalization_id]
+
+
+# STEP 4: Use rleid to create unique IDs for each run of "IMV" in the device_category
+respiratory_support_imv[, imv_run_id := rleid(device_category == "IMV"), by = hospitalization_id]
+
+
+# STEP 5: For each imv_run_id, calculate the beginning and end of each IMV run
+# Incorporating the logic for finding the next row's recorded_dttm to set the end time properly
+imv_runs_aggregated <- respiratory_support_imv[device_category == "IMV", .(
+  begin_imv = first(recorded_dttm),  # Start time of the IMV run
+  end_imv = {
+    # Find the next recorded_dttm, regardless of whether it's IMV or not
+    next_recorded_dttm <- shift(recorded_dttm, type = "lead")
+    fifelse(!is.na(next_recorded_dttm), next_recorded_dttm, last(recorded_dttm))  # Use next row's time or last IMV timestamp
+  }
+), by = .(hospitalization_id, imv_run_id)]
+
+
+# STEP 6: Identify gaps less than 24 hours between consecutive IMV runs using shift command then create a column to identify presence of gap
+imv_runs_aggregated[, next_begin_imv := shift(begin_imv, type = "lead"), by = hospitalization_id]
+imv_runs_aggregated[, time_diff_hours := difftime(next_begin_imv, end_imv, units = "hours"), by = hospitalization_id]
+imv_runs_aggregated[, combine_run := (time_diff_hours < 24), by = hospitalization_id]
+
+
+# STEP 7: Ensure proper combination by handling forward and backward combine flags using shift command
+imv_runs_aggregated[, next_combine := shift(combine_run, type = "lead", fill = FALSE), by = hospitalization_id]
+imv_runs_aggregated[, prev_combine := shift(combine_run, type = "lag", fill = FALSE), by = hospitalization_id]
+
+
+# STEP 8: Create a combined_run_id ensuring it does not group runs where combine_run is FALSE
+# The ID should increment if combine_run is FALSE and not dependent on neighbors' combine flags.
+imv_runs_aggregated[, combined_run_id := rleid(!(combine_run | prev_combine)), by = hospitalization_id]
+
+
+# STEP 9: Aggregate runs based on the combined_run_id for each hospitalization_id
+final_imv_runs <- imv_runs_aggregated[, .(
+  begin_imv = min(begin_imv),  # Earliest begin time for the combined run
+  end_imv = max(end_imv)       # Latest end time for the combined run
+), by = .(hospitalization_id, combined_run_id)]
+
+
+# STEP 10: Determine total time of each IMV run
+final_imv_runs[, total_imv_time := as.numeric(difftime(end_imv, begin_imv, units = "hours"))]
+
+
+# STEP 11: Only Retain the first IMV Run for each hospitalization_id 
+final_imv_runs <- final_imv_runs[, .SD[1], by = hospitalization_id]
+
+
+# STEP 12: Filter rows where total_imv_time is greater than or equal to 24 hours
+final_imv_runs_filtered <- final_imv_runs[total_imv_time >= 24]
+final_imv_runs_filtered <- final_imv_runs_filtered[, .(hospitalization_id, begin_imv, end_imv, total_imv_time)]
+
+
+# Hospital IDs in the IMV Runs:
+hosp_id_imv_runs <- unique(final_imv_runs_filtered$hospitalization_id)
+
+```
+
+
+
+# PART SIX: Clean The Identified IMV Runs
+# ***Identify Intra-Hospital Transfers and only keep the first admission
+# ***Identify Trach Patients who weren't previously flagged as such (those with no trach flag and no trach collar values but remained mechanically ventilated at the time of discharge)
+# ***Filter out the trach patients and the second hospitalization for the transfers
+
+```{r}
+
+#Step 1: Flag internal hospital system transfers as discharge_dttms and admission_dttms within 24 hours that have discharge_category of "Acute Care Hospital" or "Other" as "Transfer Out"
+repeat_hosp_transfer_data <- repeat_hosp_data[, next_admission_dttm := shift(admission_dttm, type = "lead"), by = patient_id]
+repeat_hosp_transfer_data[, time_diff_hours := difftime(next_admission_dttm, discharge_dttm, units = "hours"), by = patient_id]
+repeat_hosp_transfer_data[, transfer_status := ifelse(discharge_category %in% c("Acute Care Hospital", "Other") & time_diff_hours < 24, "Transfer Out", "")]
+
+#Step 2: Flag next hospitalization as "Transfer In"
+repeat_hosp_transfer_data[, next_transfer_status := shift(transfer_status, type = "lag"), by = patient_id]
+repeat_hosp_transfer_data[next_transfer_status == "Transfer Out", transfer_status := "Transfer In"]
+
+#Step 3: Flag "Transfer In then Out" for hospitalizations that are "Transfer In" admissions followed by "Transfer Out"
+repeat_hosp_transfer_data[, lead_transfer_status := shift(transfer_status, type = "lead"), by = patient_id]
+repeat_hosp_transfer_data[transfer_status == "Transfer In" & lead_transfer_status == "Transfer Out", transfer_status := "Transfer In then Out"]
+
+repeat_hosp_transfer_data_final <- repeat_hosp_transfer_data[, c("next_transfer_status", "next_admission_dttm",
+                                                                 "time_diff_hours", "patient_id", "discharge_category", 
+                                                                 "first_trach_dttm",                                                              
+                                                                 "trach_flag", "trach_info_missing", "admission_dttm", 
+                                                                 "discharge_dttm", "first_imv_dttm", "death_dttm", 
+                                                                 "lead_transfer_status") := NULL]
+
+# Final Transfer Table
+transfer_table <- repeat_hosp_transfer_data_final[transfer_status != ""]
+
+
+# STEP 4: Bring in Previously Identified Data Tables to Help Form Final Hospitalization Timeline for IMV Run Patients
+timeline_info_imv_runs <- timeline_info[hospitalization_id %in% hosp_id_imv_runs, .(hospitalization_id, admission_dttm, discharge_dttm)]
+timeline_info_imv_runs <- unique(timeline_info_imv_runs, by = "hospitalization_id")
+
+discharge_category_imv <- hospitalization[hospitalization_id %in% hosp_id_imv_runs]
+discharge_category_imv <- discharge_category_imv[, .(patient_id, hospitalization_id, discharge_category)]
+discharge_category_imv <- unique(discharge_category_imv, by = "hospitalization_id")
+
+trach_final_imv_runs <- trach_final_imv[hospitalization_id %in% hosp_id_imv_runs]
+trach_final_imv_runs <- trach_final_imv_runs[, .(hospitalization_id, first_trach_dttm)]
+trach_final_imv_runs <- unique(trach_final_imv_runs, by = "hospitalization_id")
+
+# STEP 5: Merge STEP 4 Tables with the Final IMV Runs Filtered Table Developed in PART FIVE
+
+hosp_timeline_one <- merge(timeline_info_imv_runs, final_imv_runs_filtered, by = "hospitalization_id", all.x = TRUE)
+hosp_timeline_two <- merge(hosp_timeline_one, discharge_category_imv, by = "hospitalization_id", all.x = TRUE)
+hosp_timeline_three <- merge(hosp_timeline_two, trach_final_imv_runs, by = "hospitalization_id", all.x = TRUE)
+hosp_timeline_final <- merge(hosp_timeline_three, transfer_table, by = "hospitalization_id", all.x = TRUE)
+
+hosp_timeline_final <- hosp_timeline_final[, .(patient_id, hospitalization_id, admission_dttm, discharge_dttm, begin_imv, end_imv, total_imv_time, first_trach_dttm, discharge_category, transfer_status)]
+setorder(hosp_timeline_final, patient_id, admission_dttm)
+
+# STEP 6: Flag Patients Ventilated within 2 hours of Discharge
+hosp_timeline_final[, ventilated_at_discharge := ifelse(difftime(discharge_dttm, end_imv, units = "hours") <= 2, TRUE, FALSE)]
+
+
+# STEP 7: Identify Trached Patients who weren't previously flagged
+# Was patient mechanically ventilated at discharge and discharge_category is something other than "Expired", "Other", or "Acute Care Hospital"?
+hosp_timeline_final[, missed_trach := 
+  ifelse(ventilated_at_discharge == "TRUE" & 
+         !(discharge_category %in% c("Expired", "Other", "Acute Care Hospital", "Hospice")), 
+         TRUE, FALSE)]
+
+
+# STEP 8: Identify Patients with Linked Hospitalizations and flag them as internal transfers
+hosp_timeline_final[, internal_transfer := FALSE]
+hosp_timeline_final[, internal_transfer := 
+  (transfer_status == "Transfer In" & 
+   shift(transfer_status) %in% c("Transfer Out", "Transfer In then Out")),
+  by = patient_id]
+
+
+# STEP 9: Remove All Hospitalizations with Missed Trach Flag or internal transfer flag
+hosp_timeline_clean <- hosp_timeline_final[
+  !(missed_trach == TRUE | internal_transfer == TRUE) | 
+  is.na(missed_trach) | is.na(internal_transfer) | 
+  missed_trach == "" | internal_transfer == ""
+]
+hosp_timeline_clean[, c("missed_trach", "ventilated_at_discharge", "internal_transfer") := NULL]
+
+
+#Save to file
+fwrite(hosp_timeline_clean, file = paste0(output_dir, "imv_runs.csv.gz"))
+
+```

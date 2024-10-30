@@ -1,7 +1,7 @@
 ```{r}
 # Install Packages
 
-packages <- c("zoo", "data.table", "dplyr", "lubridate", "arrow")
+packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr")
 install_if_missing <- function(package) {
   if (!require(package, character.only = TRUE)) {
     install.packages(package, dependencies = TRUE)
@@ -16,6 +16,7 @@ library(data.table)
 library(dplyr)
 library(zoo)  # for na.locf function
 library(lubridate)
+library(tidyr)
 
 ```
 
@@ -443,7 +444,7 @@ hosp_time_clean_id <- unique(hosp_time_clean$hospitalization_id)
 ```{R}
 
 # STEP 1: Load Patient Assessments For Hospitalization_IDs above
-patient_assessments <- fread("/share/projects/data/circe/v20240331/clif/patient_assessments.csv.gz", 
+patient_assessments <- fread(paste0(data_dir, "patient_assessments.csv.gz"), 
                              select = c("hospitalization_id", "recorded_dttm", "assessment_category", 
                                         "assessment_group", "numerical_value", "categorical_value", "text_value"))[hospitalization_id %in% hosp_time_clean_id]
 
@@ -472,21 +473,70 @@ hosp_rass_clean <- hosp_time_rass[!is.na(time_to_first_rass) & time_to_first_ras
 hosp_id_rass_clean <- unique(hosp_rass_clean$hospitalization_id)
 pat_id_rass_clean <- unique(hosp_rass_clean$patient_id)
 
+filtered_hosp_ids_seven <- setdiff(hosp_time_clean_id, hosp_id_rass_clean)
+
 ```
 
 
 # PART EIGHT: Final Cleaning Step: Identify hospitalizations with missing vitals data
-# ***Load in remaining CLIF Tables and identify those hospitalizations with missing vitals values
+# ***Load in vitals table
+# ***Calculate BMI and filter out patients with improbably low and high values
 
 
 ```{R}
 
 # STEP 1: Upload CLIF Vitals 
-vitals <- fread(paste0(data_dir,"vitals.csv.gz"), select = c("hospitalization_id", "recorded_dttm", "vital_category", "vital_value"))[hospitalization_id %in% hosp_id_rass_clean]
-setorder(vitals, hospitalization_id, recorded_dttm)
+specific_vital_categories <- c("sbp", "dbp", "height_cm", "weight_kg", "heart_rate", "respiratory_rate", "temp_c", "spo2")  # Replace with your actual categories
 
-hosp_id_vitals_clean <- unique(vitals$hospitalization_id)
+vitals <- fread(paste0(data_dir, "vitals.csv.gz"), 
+  select = c("hospitalization_id", "recorded_dttm", "vital_category", "vital_value")
+)[hospitalization_id %in% hosp_id_rass_clean & vital_category %in% specific_vital_categories]
 
+
+vitals_weight_height <- vitals[vital_category %in% c("weight_kg", "height_cm")]
+
+
+# Reshape the data to put weight into separate columns, using 'mean' to handle duplicates
+vitals_weight_height <- dcast(vitals_weight_height, 
+                   hospitalization_id + recorded_dttm ~ vital_category, 
+                   value.var = "vital_value", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+vitals_weight_height <- vitals_weight_height[, .(hospitalization_id, recorded_dttm, weight_kg, height_cm)]
+setorder(vitals_weight_height, hospitalization_id, recorded_dttm)
+
+# Filter Out improbably low weights and select first weight
+admission_weights <- vitals_weight_height[
+  weight_kg >= 40,  # Filter out extreme values
+  .(admission_weight = weight_kg[1]),  # Select the first weight for each group
+  by = hospitalization_id
+]
+
+# Filter Out Improbably low heights and select first height
+admission_heights <- vitals_weight_height[
+  height_cm >= 100,  # Filter out extreme values
+  .(admission_height = height_cm[1]),  # Select the first height for each group
+  by = hospitalization_id
+]
+
+# Determine BMI
+admission_bmi <- merge(admission_weights, admission_heights, by = "hospitalization_id", all = TRUE)
+admission_bmi[, height_m := admission_height / 100]
+admission_bmi[, bmi := admission_weight / (height_m^2)]
+
+admission_bmi <- admission_bmi[!is.na(bmi) & bmi != ""]
+admission_bmi_final <- admission_bmi[bmi >= 12 & bmi <= 80]
+admission_bmi_final <- admission_bmi_final[, .(hospitalization_id, bmi)]
+
+hosp_id_vitals_clean <- unique(admission_bmi_final$hospitalization_id)
+
+
+```
+
+
+
+
+```{R}
 # STEP 2: Upload CLIF Labs
 # Labs Table Conversion to recorded_dttm
 # Using Lab Collect DTTM as the marker instead of order or result
@@ -506,10 +556,13 @@ hosp_clean_time <- hosp_rass_clean[, .(hospitalization_id, begin_imv, end_imv, t
 # Expand table to create 1-hour increments from admission_dttm to discharge_dttm for all hospitalization_ids
 hosp_clean_timeline <- hosp_clean_time[, .(recorded_dttm = seq(
                                           from = as.POSIXct(min(begin_imv)) - hours(24), 
-                                          to = as.POSIXct(min(begin_imv)),
-                                          by = "1 hour")), 
+                                          to = as.POSIXct(min(begin_imv) + hours(48)),
+                                          by = "15 min")), 
                                   by = .(hospitalization_id)]
 
+
+
+filtered_hosp_ids_eight <- setdiff(hosp_id_rass_clean, hosp_id_vitals_clean)
 
 ```
 
@@ -537,101 +590,562 @@ paralytic_clean <- merge(hosp_clean_time, earliest_paralytics, by = "hospitaliza
 # STEP 5: Identify patients paralyzed within first 48 hours after beginning mechanical ventilation
 paralytic_clean[, paralyzed := as.logical(abs(difftime(earliest_paralytic_dttm, begin_imv, units = "hours")) <= 48)]
 
+
 # STEP 6: Fill Table Out and Choose Only hospitalization and paralytic data
 paralytic_clean[, paralyzed := fifelse(is.na(paralyzed) | paralyzed == "", FALSE, paralyzed)]
 paralytic_final <- paralytic_clean[, .(hospitalization_id, paralyzed)]
 
 paralytic_clean %>% distinct(hospitalization_id)
 
+paralyzed_hospitalizations <- paralytic_final[paralyzed == TRUE, unique(hospitalization_id)]
+
+hosp_id_vitals_paralyzed <- unique(admission_bmi_final$hospitalization_id)
+
+unparalyzed_hospital_ids <- setdiff(hosp_id_vitals_clean, paralyzed_hospitalizations)
 ```
 
 
 
 # PART TEN: Build RASS Percentage Table
-# ***This Table is still under development
 ```{R}
 
 # STEP 1: Filter previous RASS table only for those with clean hospitalization ids
-pat_assess_rass_filt <- pat_assess_rass[hospitalization_id %in% hosp_id_rass_clean]
-setorder(pat_assess_rass_filt, hospitalization_id, recorded_dttm)
+pat_assess_rass_clean <- pat_assess_rass[hospitalization_id %in% hosp_id_vitals_clean]
+setorder(pat_assess_rass_clean, hospitalization_id, recorded_dttm)
 
 
 # STEP 2: Reshape the data to spread RASS into a column
-pat_assess_rass <- dcast(pat_assess_rass, 
+pat_assess_rass_clean <- dcast(pat_assess_rass_clean, 
                    hospitalization_id + recorded_dttm ~ assessment_category, 
                    value.var = "numerical_value", 
                    fun.aggregate = mean,  # Aggregate duplicates using mean
                    fill = NA)  # Fill missing values with NA
-pat_assess_rass <- pat_assess_rass[, .(hospitalization_id, recorded_dttm, RASS)]
+pat_assess_rass_clean <- pat_assess_rass_clean[, .(hospitalization_id, recorded_dttm, RASS)]
 
 
-# STEP 3: Merge Hosp Time Clean with RASS
-rass_hosp_clean <- merge(hosp_rass_clean, pat_assess_rass, by = "hospitalization_id", all.x = TRUE)
-
-
-# STEP 4: Merge with Timeline
-rass_timeline <- merge(hosp_clean_timeline, rass_hosp_clean, by = c("hospitalization_id", "recorded_dttm"), 
+# STEP 3: Merge with Timeline to give additional data points for filling
+rass_timeline <- merge(hosp_clean_timeline, pat_assess_rass_clean, by = c("hospitalization_id", "recorded_dttm"), 
                          all = TRUE)
+
+# STEP 4: Merge Hosp Time Clean with RASS
+rass_timeline_clean <- merge(hosp_clean_time, rass_timeline, by = "hospitalization_id", all.x = TRUE)
 
 
 # STEP 5: Use LOCF to fill out missing RASS Data
-rass_timeline[RASS == "", assessment_category := NA]
-rass_timeline[, RASS := na.locf(RASS, na.rm = FALSE), by = hospitalization_id]
+rass_timeline_clean[RASS == "", RASS := NA]
+rass_timeline_clean[, RASS := na.locf(RASS, na.rm = FALSE), by = hospitalization_id]
 
 
 # STEP 6: Filter only for values between begin_imv and 72 hours after IMV (or if extubated/expired before 72 hours then however long they were ventilated for)
 
+
+# Ensure begin_imv, end_imv, and recorded_dttm are in POSIXct format
+rass_timeline_clean[, `:=`(begin_imv = as.POSIXct(begin_imv, origin = "1970-01-01"),
+                           end_imv = as.POSIXct(end_imv, origin = "1970-01-01"),
+                           recorded_dttm = as.POSIXct(recorded_dttm, origin = "1970-01-01"))]
+
 # Calculate start_time
-rass_timeline[, start_time := as.POSIXct(begin_imv)]
+rass_timeline_clean[, start_time := as.POSIXct(begin_imv)]
 
 # Calculate end_time based on the condition for each hospitalization_id
-rass_timeline[, end_time := ifelse(total_imv_time >= 72, 
-                                      as.POSIXct(begin_imv) + hours(72),  
-                                      as.POSIXct(end_imv)), by = hospitalization_id]
+rass_timeline_clean[, end_time := ifelse(total_imv_time >= 48, 
+                                         as.POSIXct(begin_imv) + hours(48),  
+                                         as.POSIXct(end_imv)), 
+                     by = hospitalization_id]
+
+# Ensure end_time is in POSIXct format
+rass_timeline_clean[, end_time := as.POSIXct(end_time, origin = "1970-01-01")]
+
+# Create a new data.table with `hospitalization_id`, `end_time`, and NA RASS score
+end_time_rows <- rass_timeline_clean[, .(hospitalization_id, recorded_dttm = end_time, RASS = NA)]
+
+# Bind the new `end_time_rows` back to the original data
+rass_timeline_extended <- rbind(rass_timeline_clean, end_time_rows, fill = TRUE)
 
 # Filter the table to retain rows where recorded_dttm is within the time range
-rass_hosp_filt <- rass_timeline[recorded_dttm >= start_time & recorded_dttm <= end_time]
-rass_hosp_filt <- rass_hosp_filt[, .(hospitalization_id, recorded_dttm, RASS)]
+rass_hosp_filt <- rass_timeline_extended[recorded_dttm >= start_time & recorded_dttm <= end_time]
+
+# Final filtered table with relevant columns
+rass_hosp_final <- rass_hosp_filt[, .(hospitalization_id, recorded_dttm, begin_imv, RASS)]
 
 
-# STEP 7: Identify the percent time spent in deep sedation
+# STEP 7: Flag patients with RASS scores of -3 or lower as deep sedation
+rass_hosp_final[, deep_sedation := RASS <= -3]
+
+# STEP 8: Calculate total time for each hospitalization_id
+rass_hosp_final[, time_total := as.numeric(difftime(max(recorded_dttm), min(recorded_dttm), units = "hours")), 
+               by = hospitalization_id]
+
+# STEP 9: Calculate the time spent in deep sedation (deep_sedation == TRUE)
+rass_hosp_final[, time_deep_sedation := sum(as.numeric(difftime(shift(recorded_dttm, type = "lead"), recorded_dttm, units = "hours")) * deep_sedation, na.rm = TRUE), 
+               by = hospitalization_id]
+
+# STEP 10: # Calculate the percent of time in deep sedation
+rass_hosp_final[, percent_deep_sedation := (time_deep_sedation / time_total) * 100]
+
+
+# STEP 11: Final Table
+rass_percentages <- rass_hosp_final[, .(percent_deep_sedation = mean(percent_deep_sedation, na.rm = TRUE)), 
+                                  by = hospitalization_id]
+
+```
+
+# PART ELEVEN: BUILD OF LAPS2 TABLE
+
+```{R}
+
+
+#Vitals Table
+vitals_lapstwo <- vitals[vital_category %in% c("sbp", "heart_rate", "respiratory_rate", "temp_c", "spo2")]
+
+
+# Filter Out Erroneous Values
+# Remove heart_rate >250, respiratory_rate >60
+vitals_lapstwo <- vitals_lapstwo[
+  !(vital_category == "heart_rate" & vital_value > 250) & 
+  !(vital_category == "respiratory_rate" & vital_value > 60)
+]
+
+
+# Reshape the data to spread vitals into separate columns, using 'mean' to handle duplicates
+vitals_lapstwo <- dcast(vitals_lapstwo, 
+                   hospitalization_id + recorded_dttm ~ vital_category, 
+                   value.var = "vital_value", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+setorder(vitals_lapstwo, hospitalization_id, recorded_dttm)
+
+
+# Merge with hosp_clean_time
+vitals_lapstwo_merge <- merge(hosp_clean_time, vitals_lapstwo, by = "hospitalization_id", all.x = TRUE)
+
+#TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+vitals_lapstwo_merge[, start_time := as.POSIXct(begin_imv) - hours(24)]
+
+# Calculate end_time based on the condition for each hospitalization_id
+vitals_lapstwo_merge[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+vitals_lapstwo_filt <- vitals_lapstwo_merge[recorded_dttm >= start_time & recorded_dttm <= end_time]
+vitals_lapstwo_final <- vitals_lapstwo_filt[, .(hospitalization_id, recorded_dttm, sbp, heart_rate, respiratory_rate, temp_c, spo2)]
+
+
+# Calculate Shock Index
+vitals_lapstwo_final[, shock_index := heart_rate / sbp]
+
+
+#Labs Table
+labs_lapstwo <- labs[lab_category %in% c("ph_arterial", "pco2_arterial", "po2_arterial", "lactate", "sodium", "potassium", "creatinine", "bicarbonate", "wbc", "hemoglobin", "platelet_count", "albumin", "bilirubin_total", "bun", "glucose_serum", "inr", "troponin_i", "troponin_t", "chloride")]
+
+# Reshape the data to spread vitals into separate columns, using 'mean' to handle duplicates
+labs_lapstwo <- dcast(labs_lapstwo, 
+                   hospitalization_id + recorded_dttm ~ lab_category, 
+                   value.var = "lab_value_numeric", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+setorder(labs_lapstwo, hospitalization_id, recorded_dttm)
+
+# Merge with hosp_clean_time
+labs_lapstwo_merge <- merge(hosp_clean_time, labs_lapstwo, by = "hospitalization_id", all.x = TRUE)
+
+#TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+labs_lapstwo_merge[, start_time := as.POSIXct(begin_imv) - hours(24)]
+
+# Calculate end_time based on the condition for each hospitalization_id
+labs_lapstwo_merge[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+labs_lapstwo_filt <- labs_lapstwo_merge[recorded_dttm >= start_time & recorded_dttm <= end_time]
+labs_lapstwo_final <- labs_lapstwo_filt[, .(hospitalization_id, recorded_dttm, ph_arterial, pco2_arterial, po2_arterial, lactate, sodium, potassium, creatinine, bicarbonate, wbc, hemoglobin, platelet_count, albumin, bilirubin_total, bun, glucose_serum, inr, troponin_i, troponin_t, chloride)]
+
+
+# Convert Hemoglobin to Hematocrit
+labs_lapstwo_final[, hematocrit := hemoglobin * 3]
+labs_lapstwo_final[, hemoglobin := NULL]
+
+
+# Create BUN/Cr
+labs_lapstwo_final[, bun_cr := bun / creatinine]
+
+# Convert Troponin t to Troponin i
+labs_lapstwo_final[, troponin_i_est := troponin_t / 10]
+labs_lapstwo_final[, troponin_t := NULL]
+
+
+# Calculate anion gap
+labs_lapstwo_final[, anion_gap := (sodium + potassium) - (chloride + bicarbonate)]
+
+
+#Calculate anion gap / bicarbonate ratio
+labs_lapstwo_final[, ag_bicarb := anion_gap / bicarbonate]
+
+
+# First Merge Vitals with Timeline
+lapstwo_table_one <- merge(hosp_clean_timeline, vitals_lapstwo_final, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+# Second Merge with Labs
+lapstwo_table_two <- merge(lapstwo_table_one, labs_lapstwo_final, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+
+# Fill in Blanks and Use LOCF to Fill Out the Table
+cols_to_update <- c("sbp", "heart_rate", "respiratory_rate", "temp_c", "spo2", "shock_index", "ph_arterial", "pco2_arterial", "po2_arterial", "lactate", "sodium", "potassium", "creatinine", "bicarbonate", "wbc", "hematocrit", "platelet_count", "albumin", "bilirubin_total", "bun", "glucose_serum", "inr", "troponin_i", "bun_cr", "troponin_i_est", "anion_gap", "ag_bicarb")
+lapstwo_table_two[, (cols_to_update) := lapply(.SD, function(x) fifelse(x == "", NA, x)), .SDcols = cols_to_update]
+
+lapstwo_table <- lapstwo_table_two[, (cols_to_update) := lapply(.SD, function(x) na.locf(x, na.rm = FALSE)),                  by = hospitalization_id, .SDcols = cols_to_update]
+
 
 
 ```
 
 
-# PART ELEVEN: Develop SOFA SCORE Model
-# ***Still under development
+# Determine High Risk vs Low Risk LAPSTwo
 ```{R}
 
-# STEP 1: Determine Height, Weight, and BMI Baseline
-# THIS STEP STILL UNDER DEVELOPMENT AND NOT YET IMPLEMENTED TO CODE BELOW
-# Need baseline kg to make SOFA Score accurate
+# Merge Laps2 table with Age at Admission and Sex Data to Calculate the Risk Model
+# Age at Admission
+age_at_admission_laps <- hospitalization[hospitalization_id %in% hosp_id_vitals_clean, .(patient_id, hospitalization_id, age_at_admission)]
 
-# Weight, Height Specific Vitals
-vitals_weight_height <- vitals[vital_category %in% c("weight_kg", "height_cm")]
+pat_id_laps <- unique(age_at_admission_laps$patient_id)
 
-vitals_weight_height %>% distinct(hospitalization_id)
+# Clean version of Patient Table
+patient_laps <- patient[patient_id %in% pat_id_laps]
 
-# Reshape the data to put weight into separate columns, using 'mean' to handle duplicates
-vitals_weight_height <- dcast(vitals_weight_height, 
-                   hospitalization_id + recorded_dttm ~ vital_category, 
-                   value.var = "vital_value", 
-                   fun.aggregate = mean,  # Aggregate duplicates using mean
-                   fill = NA)  # Fill missing values with NA
-vitals_weight_height <- vitals_weight_height[, .(hospitalization_id, recorded_dttm, weight_kg, height_cm)]
-setorder(vitals_weight_height, hospitalization_id, recorded_dttm)
+# Merge Patient and Age at Admission
 
-# Merge with hosp_clean_time
-hosp_clean_weight_height <- merge(hosp_clean_time, vitals_weight_height, by = "hospitalization_id", all = TRUE)
+demographics_laps <- merge(age_at_admission_laps, patient_laps, by = "patient_id", all.x = TRUE)
+demographics_laps <- demographics_laps[, .(hospitalization_id, age_at_admission, sex_category)]
 
-# *******
+# Merge Demographics with LAPS
+lapstwo_risk <- merge(demographics_laps,lapstwo_table, by = "hospitalization_id", all = TRUE)
+lapstwo_risk <- lapstwo_risk[, .(hospitalization_id, age_at_admission, sex_category, bun_cr, sodium, ag_bicarb)]
 
-
-# STEP 2: Develop Data Tables Needed for SOFA Score Tabulation
+# Impute normal values for NA values
+# Replace NAs with specific values if all values in a column for a given hospitalization_id are NA
+lapstwo_risk[ , bun_cr := if (all(is.na(bun_cr))) 10 else bun_cr, by = hospitalization_id]
+lapstwo_risk[ , sodium := if (all(is.na(sodium))) 140 else sodium, by = hospitalization_id]
+lapstwo_risk[ , ag_bicarb := if (all(is.na(ag_bicarb))) 2.5 else ag_bicarb, by = hospitalization_id]
 
 
-# MAP Table
+# Define model intercept
+intercept <- 0
+
+# Function to calculate mortality risk score
+lapstwo_risk[, `:=`(
+  age_component = fifelse(age_at_admission >= 18 & age_at_admission <= 39, 0,
+                  fifelse(age_at_admission >= 40 & age_at_admission <= 64, -0.25234,
+                  fifelse(age_at_admission >= 65 & age_at_admission <= 74, 0.25894,
+                  fifelse(age_at_admission >= 75 & age_at_admission <= 84, 0.48826, 0.87647)))),
+  
+  sex_component = fifelse(sex_category == "Female", 0, 0.27430),
+  
+  bun_cr_component = fifelse(bun_cr < 8, 0.26988,
+                     fifelse(bun_cr >= 8 & bun_cr <= 15.9, 0,
+                     fifelse(bun_cr >= 16 & bun_cr <= 23.9, -0.22465, 0.39858))),
+  
+  sodium_component = fifelse(sodium < 129, 0.11980,
+                     fifelse(sodium >= 129 & sodium <= 131, -0.06801,
+                     fifelse(sodium >= 132 & sodium <= 134, -0.30494,
+                     fifelse(sodium >= 135 & sodium <= 145, 0,
+                     fifelse(sodium >= 146 & sodium <= 148, -0.02560,
+                     fifelse(sodium >= 149 & sodium <= 154, 0.42071, 0.58891)))))),
+  
+  ag_bicarb_component = fifelse(ag_bicarb < 200, -0.20038,
+                        fifelse(ag_bicarb >= 200 & ag_bicarb <= 399, 0,
+                        fifelse(ag_bicarb >= 400 & ag_bicarb <= 599, -0.11174, 0.70227)))
+)]
+
+# Now, calculate the total risk score based on the individual components
+lapstwo_risk[, mortality_risk := intercept +
+                                age_component +
+                                sex_component +
+                                bun_cr_component +
+                                sodium_component +
+                                ag_bicarb_component]
+
+# Risk
+risk_cols <- c("mortality_risk")
+
+max_lapstwo_risk <- lapstwo_risk[, lapply(.SD, max, na.rm = TRUE), by = hospitalization_id, .SDcols = risk_cols]
+
+# Classify as high or low risk based on a threshold of 6%
+threshold <- 1.06
+max_lapstwo_risk[, risk_category := ifelse(mortality_risk >= threshold, "High Risk", "Low Risk")]
+max_lapstwo_risk <- max_lapstwo_risk[, .(hospitalization_id, mortality_risk)]
+
+```
+
+# SET UP LAPSTWO SCORE TABLE
+```{R}
+# SET UP LAPSTWO SCORE TABLE
+
+# Calculate the ABG score based on lactate and pH levels
+lapstwo_table[, abg_score := fcase(
+  # Lactate < 2.00 cases
+  lactate < 2.00 & ph_arterial < 7.20, 13,
+  lactate < 2.00 & ph_arterial >= 7.20 & ph_arterial < 7.35, 5,
+  lactate < 2.00 & ph_arterial >= 7.35 & ph_arterial < 7.45, 0,
+  lactate < 2.00 & ph_arterial >= 7.45, 12,
+  
+  # Lactate 2.00-3.99 cases
+  lactate >= 2.00 & lactate < 4.00 & ph_arterial < 7.20, 19,
+  lactate >= 2.00 & lactate < 4.00 & ph_arterial >= 7.20 & ph_arterial < 7.35, 15,
+  lactate >= 2.00 & lactate < 4.00 & ph_arterial >= 7.35 & ph_arterial < 7.45, 12,
+  lactate >= 2.00 & lactate < 4.00 & ph_arterial >= 7.45, 15,
+  
+  # Lactate >= 4.00 cases
+  lactate >= 4.00 & ph_arterial < 7.20, 34,
+  lactate >= 4.00 & ph_arterial >= 7.20 & ph_arterial < 7.35, 25,
+  lactate >= 4.00 & ph_arterial >= 7.35 & ph_arterial < 7.45, 26,
+  lactate >= 4.00 & ph_arterial >= 7.45, 30,
+  
+  # Default case if neither condition is met
+  default = NA_real_
+)]
+
+
+# Calculate the sodium_score based on sodium levels
+lapstwo_table[, sodium_score := fcase(
+  sodium < 129, 14,
+  sodium >= 129 & sodium <= 134, 7,
+  sodium >= 135 & sodium <= 145, 0,
+  sodium >= 146, 4,
+  
+  # Default case if sodium is missing
+  default = NA_real_
+)]
+
+
+
+# Calculate the bili_score based on total_bilirubin levels
+lapstwo_table[, bili_score := fcase(
+  total_bilirubin < 2.0, 0,
+  total_bilirubin >= 2.0 & total_bilirubin < 3.0, 11,
+  total_bilirubin >= 3.0 & total_bilirubin < 5.0, 18,
+  total_bilirubin >= 5.0 & total_bilirubin < 8.0, 25,
+  total_bilirubin >= 8.0, 41,
+  
+  # Default case if total_bilirubin is missing
+  default = NA_real_
+)]
+
+
+
+# Calculate the bun_score based on bun levels
+lapstwo_table[, bun_score := fcase(
+  bun < 18, 0,
+  bun >= 18 & bun <= 19, 11,
+  bun >= 20 & bun <= 39, 12,
+  bun >= 40 & bun <= 79, 20,
+  bun >= 80, 25,
+  
+  # Default case if bun is missing
+  default = NA_real_
+)]
+
+
+# Calculate the creat_score based on creatinine levels
+lapstwo_table[, creat_score := fcase(
+  creatinine < 1.00, 0,
+  creatinine >= 1.00 & creatinine < 2.00, 6,
+  creatinine >= 2.00 & creatinine < 4.00, 11,
+  creatinine >= 4.00, 15,
+  
+  # Default case if creatinine is missing
+  default = NA_real_
+)]
+
+
+# Calculate the bun_cr_score based on bun_cr levels
+lapstwo_table[, bun_cr_score := fcase(
+  bun_cr < 25, 0,
+  bun_cr >= 25, 10,
+  
+  # Default case if bun_cr is missing
+  default = NA_real_
+)]
+
+
+# Calculate the albumin score based on the albumin levels
+lapstwo_table[, albumin_score := fcase(
+  albumin < 2.00, 31,
+  albumin >= 2.00 & albumin < 2.5, 15,
+  albumin >= 2.5, 0,
+  
+  # Default case if albumin is missing
+  default = NA_real_
+)]
+
+
+# Calculate the gluc_score based on glucose_serum levels
+lapstwo_table[, gluc_score := fcase(
+  glucose_serum < 40, 10,
+  glucose_serum >= 40 & glucose_serum < 59, 10,
+  glucose_serum >= 60 & glucose_serum < 199, 0,
+  glucose_serum >= 200, 3,
+  
+  # Default case if glucose is missing
+  default = NA_real_
+)]
+
+# Calculate the hct_score based on hematocrit levels
+lapstwo_table[, hct_score := fcase(
+  hematocrit < 20, 7,
+  hematocrit >= 20 & hematocrit < 39.9, 8,
+  hematocrit >= 40 & hematocrit < 49.9, 0,
+  hematocrit >= 50, 3,
+  
+  # Default case if hematocrit is missing
+  default = NA_real_
+)]
+
+# Calculate the wbc_score based on wbc levels
+lapstwo_table[, wbc_score := fcase(
+  wbc < 5.0, 8,
+  wbc >= 5.0 & wbc < 12.9, 0,
+  wbc >= 13, 11,
+  
+  # Default case if hematocrit is missing
+  # Need to identify high risk group for this one
+  default = NA_real_
+)]
+
+
+# Calculate the paco2_score based on pco2_arterial levels
+lapstwo_table[, paco2_score := fcase(
+  pco2_arterial < 35, 7,
+  pco2_arterial >= 35 & pco2_arterial <= 44, 0,
+  pco2_arterial >= 45 & pco2_arterial <= 54, 12,
+  pco2_arterial >= 55 & pco2_arterial <= 64, 13,
+  pco2_arterial >= 65, 12,
+  
+  # Default case if pco2_arterial is missing
+  default = NA_real_
+)]
+
+# Calculate the pao2_score based on the po2_arterial levels
+lapstwo_table[, pao2_score := fcase(
+  po2_arterial < 50, 8,
+  po2_arterial >= 50 & po2_arterial < 120, 0,
+  po2_arterial >= 120, 12,
+  
+  # Default case if po2_arterial is missing
+  default = NA_real_
+)]
+
+
+# Calculate the trop_score based on troponin_i levels
+lapstwo_table[, trop_score := fcase(
+  troponin_i = 0, 0,
+  troponin_i >= 0.01 & troponin_i <= 0.19, 8,
+  troponin_i >= 0.20 & troponin_i <= 0.99, 17,
+  troponin_i >= 1.00 & troponin_i <= 2.99, 19,
+  troponin_i >= 3.00, 25,
+  
+  # Default case if troponin_i is missing
+  # Need to identify high risk group for this one
+  default = NA_real_
+)]
+
+
+# Calculate the temp_score based on temp_c levels
+lapstwo_table[, temp_score := fcase(
+  temp_c < 35.56, 20,
+  temp_c >= 35.56 & temp_c < 38, 0,
+  temp_c >= 38.0, 3,
+  
+  # Default case if temp_c is missing
+  default = NA_real_
+)]
+
+
+# Calculate the hr_score based on heart_rate levels
+lapstwo_table[, hr_score := fcase(
+  heart_rate < 60, 7,
+  heart_rate >= 60 & heart_rate <= 109, 0,
+  heart_rate >= 110 & heart_rate <= 139, 7,
+  heart_rate >= 140, 10,
+  
+  # Default case if heart_rate is missing
+  default = NA_real_
+)]
+
+
+# Calculate the rr_score based on respiratory_rate levels
+lapstwo_table[, rr_score := fcase(
+  respiratory_rate < 20, 0,
+  respiratory_rate >= 320 & respiratory_rate < 30, 11,
+  respiratory_rate >= 30, 21,
+  
+  # Default case if respiratory_rate is missing
+  default = NA_real_
+)]
+
+
+# Calculate the sbp_score based on sbp levels
+lapstwo_table[, sbp_score := fcase(
+  sbp < 75, 22,
+  sbp >= 75 & sbp <= 89, 13,
+  sbp >= 90 & sbp <= 119, 5,
+  sbp >= 120 & sbp <= 139, 0,
+  sbp >= 140 & sbp <= 159, 8,
+  sbp >= 160, 14,
+  
+  # Default case if sbp is missing
+  # Need to identify high risk group for this one
+  default = NA_real_
+)]
+
+
+# Calculate the shock_score based on shock_index levels
+lapstwo_table[, shock_score := fcase(
+  shock_index < 0.65, 0,
+  shock_index >= 0.65 & shock_index < 0.85, 8,
+  shock_index >= 0.85, 17,
+  
+  # Default case if shock_index is missing
+  default = NA_real_
+)]
+
+
+# Calculate the shock_score based on shock_index levels
+lapstwo_table[, shock_score := fcase(
+  shock_index < 0.65, 0,
+  shock_index >= 0.65 & shock_index < 0.85, 8,
+  shock_index >= 0.85, 17,
+  
+  # Default case if shock_index is missing
+  default = NA_real_
+)]
+
+
+# Calculate the o2sat_score based on spo2 levels
+lapstwo_table[, o2sat_score := fcase(
+  spo2 < 90, 22,
+  spo2 >= 90 & spo2 < 94, 12,
+  spo2 >= 94, 0,
+  
+  # Default case if spo2 is missing
+  default = NA_real_
+)]
+
+
+
+
+```
+
+# PART ELEVEN: SOFA SCORE Model
+
+```{R}
+# Develop Data Tables Needed for SOFA Score Tabulation
+
+
+# STEP 1:MAP Table
 # Filter for SBP, DBP, and MAP values in vital_category
 vitals_bp <- vitals[vital_category %in% c("sbp", "dbp", "map")]
 
@@ -641,23 +1155,11 @@ vitals_bp <- dcast(vitals_bp,
                    value.var = "vital_value", 
                    fun.aggregate = mean,  # Aggregate duplicates using mean
                    fill = NA)  # Fill missing values with NA
-vitals_bp <- vitals_bp[, .(hospitalization_id, recorded_dttm, sbp, dbp, map)]
+vitals_bp <- vitals_bp[, .(hospitalization_id, recorded_dttm, sbp, dbp)]
 setorder(vitals_bp, hospitalization_id, recorded_dttm)
 
-# Define the function to update map if it's NA or an empty string
-fill_map <- function(sbp, dbp, map) {
-  # Check if map is NA or empty
-  if (is.na(map) || map == "") {
-    # Calculate and return the map value using the formula
-    return((1/3 * sbp) + (2/3 * dbp))
-  } else {
-    # If map is already present, return the original map value
-    return(map)
-  }
-}
-
-# Apply the function row-wise using data.table's ':=' to update the map column
-vitals_bp[, map := mapply(fill_map, sbp, dbp, map)]
+# Calculate MAP
+vitals_bp[, map := (1/3 * sbp) + (2/3 * dbp)]
 
 map_table <- vitals_bp[, .(hospitalization_id, recorded_dttm, map)]
 
@@ -736,7 +1238,7 @@ pao2_fio2_sofa <- pao2_fio2_merge[, .(hospitalization_id, recorded_dttm, p_to_f)
 
 
 # Creatinine Table
-#Creatinine Lab Values
+# Creatinine Lab Values
 labs_cr <- labs[lab_category %in% c("creatinine")]
 labs_cr <- labs_cr[, .(hospitalization_id, recorded_dttm, lab_category, lab_value_numeric)]
 setorder(labs_cr, hospitalization_id, recorded_dttm)
@@ -824,7 +1326,7 @@ platelets_hosp_filt <- platelets_hosp_filt[, .(hospitalization_id, recorded_dttm
 
 # GCS Table
 # Identify GCS_Total Values
-pat_assess_gcs <- patient_assessments[assessment_category == "gcs_total"]
+pat_assess_gcs <- patient_assessments[assessment_category == "gcs_total"][hospitalization_id %in% hosp_id_vitals_clean]
 setorder(pat_assess_gcs, hospitalization_id, recorded_dttm)
 
 # Reshape the data to spread GCS into a column, using 'mean' to handle duplicates
@@ -857,8 +1359,20 @@ meds_sofa <- meds_sofa[, .(hospitalization_id, admin_dttm, med_category, med_dos
 setnames(meds_sofa, "admin_dttm", "recorded_dttm")
 setorder(meds_sofa, hospitalization_id, recorded_dttm)
 
+# Merge with Weight Data
+meds_sofa_weight <- merge(meds_sofa, admission_bmi, by = "hospitalization_id", all.x = TRUE)
+meds_sofa_weight <- meds_sofa_weight[, .(hospitalization_id, recorded_dttm, med_category, med_dose, med_dose_unit, admission_weight)]
+
+meds_sofa_weight[, med_dose_weight := fifelse(
+  med_dose_unit %in% c("mcg/kg/min", "MCG/KG/MIN", "Mcg/Kg/Min"), 
+  med_dose, 
+  med_dose / admission_weight
+)]
+meds_sofa_weight_clean <- meds_sofa_weight[, .(hospitalization_id, recorded_dttm, med_category, med_dose_weight)]
+
 # Merge Hosp Time Clean with SOFA Meds
-meds_sofa_hosp_clean <- merge(hosp_time_clean, meds_sofa, by = "hospitalization_id", all.x = TRUE)
+meds_sofa_hosp_clean <- merge(hosp_time_clean, meds_sofa_weight_clean, by = "hospitalization_id", all.x = TRUE)
+
 
 #TIME FILTERING
 # Calculate start_time (24 hours before begin_imv)
@@ -869,7 +1383,7 @@ meds_sofa_hosp_clean[, end_time := as.POSIXct(begin_imv), by = hospitalization_i
 
 # Filter the table to retain rows where recorded_dttm is within the time range
 meds_sofa_hosp_filt <- meds_sofa_hosp_clean[recorded_dttm >= start_time & recorded_dttm <= end_time]
-meds_sofa_hosp_filt <- meds_sofa_hosp_filt[, .(hospitalization_id, recorded_dttm, med_category, med_dose)]
+meds_sofa_hosp_filt <- meds_sofa_hosp_filt[, .(hospitalization_id, recorded_dttm, med_category, med_dose_weight)]
 
 
 # ******
@@ -881,39 +1395,52 @@ sofa_table_one <- merge(hosp_clean_timeline, pao2_fio2_sofa,
                          by = c("hospitalization_id", "recorded_dttm"), 
                          all = TRUE)
 
+sofa_table_one %>% distinct(hospitalization_id)
+
 # Second Merge with Platelets
 sofa_table_two <- merge(sofa_table_one, platelets_hosp_filt, 
                          by = c("hospitalization_id", "recorded_dttm"), 
                          all = TRUE)
+
+sofa_table_two %>% distinct(hospitalization_id)
 
 # Third Merge with GCS
 sofa_table_three <- merge(sofa_table_two, gcs_hosp_filt, 
                          by = c("hospitalization_id", "recorded_dttm"), 
                          all = TRUE)
 
+sofa_table_three %>% distinct(hospitalization_id)
+
 # Fourth Merge with Bilirubin
 sofa_table_four <- merge(sofa_table_three, bili_hosp_filt, 
                          by = c("hospitalization_id", "recorded_dttm"), 
                          all = TRUE)
+
+sofa_table_four %>% distinct(hospitalization_id)
 
 # Fifth Merge with Creatinine
 sofa_table_five <- merge(sofa_table_four, cr_hosp_filt, 
                          by = c("hospitalization_id", "recorded_dttm"), 
                          all = TRUE)
 
+sofa_table_five %>% distinct(hospitalization_id)
+
 # Sixth Merge with MAP
 sofa_table_six <- merge(sofa_table_five, map_table_final, 
                          by = c("hospitalization_id", "recorded_dttm"), 
                          all = TRUE)
+
+sofa_table_six %>% distinct(hospitalization_id)
 
 # Final Merge with SOFA Meds
 sofa_table_final <- merge(sofa_table_six, meds_sofa_hosp_filt, 
                          by = c("hospitalization_id", "recorded_dttm"), 
                          all = TRUE)
 
+sofa_table_final %>% distinct(hospitalization_id)
 
 # Fill in Blanks and Use LOCF to Fill Out the Table
-cols_to_update <- c("p_to_f", "platelet_count", "gcs_total", "bilirubin_total", "creatinine", "map", "med_category", "med_dose")
+cols_to_update <- c("p_to_f", "platelet_count", "gcs_total", "bilirubin_total", "creatinine", "map", "med_category", "med_dose_weight")
 sofa_table_final[, (cols_to_update) := lapply(.SD, function(x) fifelse(x == "", NA, x)), .SDcols = cols_to_update]
 
 sofa_table <- sofa_table_final[, (cols_to_update) := lapply(.SD, function(x) na.locf(x, na.rm = FALSE)), 
@@ -977,15 +1504,15 @@ sofa_table[, renal_sofa := fcase(
 sofa_table[, card_sofa := fcase(
   map > 70 & is.na(med_category), 0,
   map < 70 & is.na(med_category), 1,
-  med_category == "dopamine" & med_dose <= 5, 2,
+  med_category == "dopamine" & med_dose_weight <= 5, 2,
   med_category == "dobutamine", 2,
-  med_category == "dopamine" & med_dose > 5, 3,
-  med_category == "epinephrine" & med_dose <= 0.1, 3,
-  med_category == "norepinephrine" & med_dose <= 0.1, 3,
-  med_category == "dopamine" & med_dose >= 15, 4,
-  med_category == "epinephrine" & med_dose > 0.1, 4,
-  med_category == "norepinephrine" & med_dose > 0.1, 4,
-  is.na(map) | is.na(med_category) | is.na(med_dose), 0  # Assign 0 if any relevant value is NA
+  med_category == "dopamine" & med_dose_weight > 5, 3,
+  med_category == "epinephrine" & med_dose_weight <= 0.1, 3,
+  med_category == "norepinephrine" & med_dose_weight <= 0.1, 3,
+  med_category == "dopamine" & med_dose_weight >= 15, 4,
+  med_category == "epinephrine" & med_dose_weight > 0.1, 4,
+  med_category == "norepinephrine" & med_dose_weight > 0.1, 4,
+  is.na(map) | is.na(med_category) | is.na(med_dose_weight), 0  # Assign 0 if any relevant value is NA
 )]
 
 
@@ -996,14 +1523,13 @@ sofa_cols <- c("pulm_sofa", "heme_sofa", "neuro_sofa", "gi_sofa", "renal_sofa", 
 # STEP 6: Create a new table with the maximum SOFA scores per hospitalization_id
 max_sofa_table <- sofa_table[, lapply(.SD, max, na.rm = TRUE), by = hospitalization_id, .SDcols = sofa_cols]
 
-# **** THERE ARE EXTRA HOSPITALIZATION_IDS IN HERE ****
 
 # STEP 7: Calculate total SOFA score
 max_sofa_table[, total_sofa := pulm_sofa + heme_sofa + neuro_sofa + gi_sofa + renal_sofa + card_sofa]
 
 sofa_final <- max_sofa_table[, .(hospitalization_id, total_sofa)] 
 
-
+sofa_final %>% distinct(hospitalization_id)
 ```
 
 
@@ -1011,64 +1537,638 @@ sofa_final <- max_sofa_table[, .(hospitalization_id, total_sofa)]
 ```{R}
 
 # Age at Admission
+age_at_admission <- hospitalization[hospitalization_id %in% hosp_id_vitals_clean, .(patient_id, hospitalization_id, age_at_admission)]
 
+pat_id_final <- unique(age_at_admission$patient_id)
 
 # Clean version of Patient Table
-patient_clean <- patient[patient_id %in% pat_rass_id_clean]
+patient_clean <- patient[patient_id %in% pat_id_final]
 
-# Merge Patient and hosp_rass_clean
+# Merge Patient and Age at Admission
 
-patient_merged <- merge(hosp_rass_clean, patient_clean, by = "patient_id", all.x = TRUE)
-patient_merged <- patient_merged[, .(patient_id, hospitalization_id, race_category, ethnicity_category, sex_category, language_name)]
+demographics <- merge(age_at_admission, patient_clean, by = "patient_id", all.x = TRUE)
+demographics <- demographics[, .(hospitalization_id, race_category, ethnicity_category, sex_category, language_name, age_at_admission)]
+demographics[, language_category := fifelse(language_name == "English", "English",
+                         fifelse(language_name == "Spanish", "Spanish",
+                         fifelse(language_name %in% c("Other", "Unknown", "Patient Declined", ""), "Unknown", 
+                         "Other Language")))]
+
 
 
 # Summary Statistics of Cohort
-summary_stats <- patient_merged[, .(
+summary_stats <- demographics[, .(
   race_category_counts = .N, by = race_category,
   ethnicity_category_counts = .N, by = ethnicity_category,
   sex_category_counts = .N, by = sex_category,
-  language_name_counts = .N, by = language_name
+  language_category_counts = .N, by = language_category
 )]
-summary_stats_race <- patient_merged[, .N, by = race_category][order(-N)]
-summary_stats_ethnicity <- patient_merged[, .N, by = ethnicity_category][order(-N)]
-summary_stats_sex <- patient_merged[, .N, by = sex_category][order(-N)]
-summary_stats_language <- patient_merged[, .N, by = language_name][order(-N)]
+summary_stats_race <- demographics[, .N, by = race_category][order(-N)]
+summary_stats_ethnicity <- demographics[, .N, by = ethnicity_category][order(-N)]
+summary_stats_sex <- demographics[, .N, by = sex_category][order(-N)]
+summary_stats_language <- demographics[, .N, by = language_category][order(-N)]
 
-hispanic_english_count <- patient_merged[ethnicity_category == "Hispanic" & language_name == "English", .N]
-hispanic_spanish_count <- patient_merged[ethnicity_category == "Hispanic" & language_name == "Spanish", .N]
-hispanic_declined_count <- patient_merged[ethnicity_category == "Hispanic" & language_name == "Patient Declined", .N]
+hispanic_english_count <- demographics[ethnicity_category == "Hispanic" & language_name == "English", .N]
+hispanic_spanish_count <- demographics[ethnicity_category == "Hispanic" & language_name == "Spanish", .N]
+hispanic_declined_count <- demographics[ethnicity_category == "Hispanic" & language_name == "Patient Declined", .N]
 
-black_english_count <- patient_merged[race_category == "Black or African American" & language_name == "English", .N]
-black_unknown_count <- patient_merged[race_category == "Black or African American" & language_name == "Unknown", .N]
-black_blank_count <- patient_merged[race_category == "Black or African American" & language_name == "", .N]
-black_declined_count <- patient_merged[race_category == "Black or African American" & language_name == "Patient Declined", .N]
+black_english_count <- demographics[race_category == "Black or African American" & language_name == "English", .N]
+black_unknown_count <- demographics[race_category == "Black or African American" & language_name == "Unknown", .N]
+black_blank_count <- demographics[race_category == "Black or African American" & language_name == "", .N]
+black_declined_count <- demographics[race_category == "Black or African American" & language_name == "Patient Declined", .N]
 
-asian_english_count <- patient_merged[race_category == "Asian" & language_name == "English", .N]
-asian_unknown_count <- patient_merged[race_category == "Asian" & language_name == "Unknown", .N]
-asian_blank_count <- patient_merged[race_category == "Asian" & language_name == "", .N]
-asian_declined_count <- patient_merged[race_category == "Asian" & language_name == "Patient Declined", .N]
+asian_english_count <- demographics[race_category == "Asian" & language_name == "English", .N]
+asian_unknown_count <- demographics[race_category == "Asian" & language_name == "Unknown", .N]
+asian_blank_count <- demographics[race_category == "Asian" & language_name == "", .N]
+asian_declined_count <- demographics[race_category == "Asian" & language_name == "Patient Declined", .N]
 
 
 ```
+
+```{R}
+# ADT?
+adt <- fread(paste0(data_dir,"adt.csv.gz"))[hospitalization_id %in% hosp_id_vitals_clean]
+
+adt_hosp <- merge(hosp_clean_time, adt, by = "hospitalization_id", all.x = TRUE)
+
+
+associated_hospital_ids <- adt_hosp[, .(hospital_ids = unique(hospital_id)), by = hospitalization_id]
+
+associated_hospital_ids_filtered <- associated_hospital_ids[!is.na(hospital_ids) & hospital_ids != ""]
+
+# Get unique rows based on hospitalization_id
+hospital_ids_final <- unique(associated_hospital_ids_filtered, by = "hospitalization_id")
+
+```
+
+
+```{R}
+
+# Determining Pandemic Admissions
+# We don't have COVID Status
+
+pandemic_admissions <- hosp_clean_time[hospitalization_id %in% hosp_id_vitals_clean, .(hospitalization_id, begin_imv)]
+
+# Define the pandemic start and end dates
+begin_pan_date <- as.POSIXct("2020-01-31 00:00", format="%Y-%m-%d %H:%M")
+end_pan_date <- as.POSIXct("2023-05-11 00:00", format="%Y-%m-%d %H:%M")
+
+# Add begin_pan and end_pan columns with these dates
+pandemic_admissions[, `:=`(begin_pan = begin_pan_date, end_pan = end_pan_date)]
+
+# Create the pandemic_admission column by checking if begin_imv falls between begin_pan and end_pan
+pandemic_admissions[, pandemic_admission := begin_imv >= begin_pan & begin_imv <= end_pan]
+
+pandemic_admissions_final <- pandemic_admissions[, .(hospitalization_id, pandemic_admission)]
+
+
+```
+
+ 
+# Time to SBT
+ 
+```{R}
+# Ensure 'sbt_delivery' is a column with 'Yes'/'No' values
+pat_assess_sbt <- patient_assessments[assessment_category == "sbt_delivery" &
+                                      hospitalization_id %in% hosp_id_vitals_clean]
+setorder(pat_assess_sbt, hospitalization_id, recorded_dttm)
+
+# Use dcast to pivot the data without aggregation, filling any missing values with NA
+pat_assess_sbt <- dcast(pat_assess_sbt, 
+                        hospitalization_id + recorded_dttm ~ assessment_category, 
+                        value.var = "categorical_value", 
+                        fill = NA)
+
+# Merge with hospitalization characteristics to include begin_imv and end_imv timestamps
+hosp_characteristics <- hosp_clean_time[hospitalization_id %in% hosp_id_vitals_clean, .(hospitalization_id, begin_imv, end_imv)]
+sbt_hosp_merge <- merge(hosp_characteristics, pat_assess_sbt, by = "hospitalization_id", all = TRUE)
+
+# Filter for sbt_delivery == "Yes" and recorded_dttm between begin_imv and end_imv, then calculate the earliest recorded_dttm
+first_sbt <- sbt_hosp_merge[sbt_delivery == "Yes" & recorded_dttm > begin_imv & recorded_dttm <= end_imv, 
+                            .(first_sbt = min(recorded_dttm)),  # Get the earliest recorded_dttm
+                            by = hospitalization_id]
+
+# Merge again
+first_sbt_hosp <- merge(hosp_characteristics, first_sbt, by = "hospitalization_id", all = TRUE)
+
+
+# Fill in missing values in first_sbt with end_imv
+first_sbt_hosp[is.na(first_sbt), first_sbt := end_imv]
+
+# Calculate the time difference in hours between begin_imv and first_sbt
+first_sbt_hosp[, time_to_first_sbt := as.numeric(difftime(first_sbt, begin_imv, units = "hours"))]
+
+first_sbt_calc <- first_sbt_hosp[, .(hospitalization_id, time_to_first_sbt)]
+
+
+```
+
+
 
 
 # PART THIRTEEN: Assembly of Final Analytic Table
 
 ```{R}
 
-# Demographics
+# First Merge Demographics and RASS Percent
+analytic_table_one <- merge(demographics, rass_percentages, by = "hospitalization_id", all.x = TRUE)
+setnames(analytic_table_one, 
+         old = c("race_category", "ethnicity_category", "sex_category", "language_category", "age_at_admission"), 
+         new = c("race", "ethnicity", "sex", "language", "age"))
+analytic_table_one$ethnicity <- relevel(as.factor(analytic_table_one$ethnicity), ref = "Non-Hispanic")
+analytic_table_one$race <- relevel(as.factor(analytic_table_one$race), ref = "White")
+analytic_table_one$sex <- relevel(as.factor(analytic_table_one$sex), ref = "Male")
 
-# BMI
+# Second Merge with BMI
+analytic_table_two <- merge(analytic_table_one, admission_bmi_final, by = "hospitalization_id", all.x = TRUE)
+analytic_table_two$ethnicity <- relevel(as.factor(analytic_table_one$ethnicity), ref = "Non-Hispanic")
+analytic_table_two$race <- relevel(as.factor(analytic_table_one$race), ref = "White")
+analytic_table_two$sex <- relevel(as.factor(analytic_table_one$sex), ref = "Male")
 
-# SOFA
+# Third merge with Paralysis
+analytic_table_three <- merge(analytic_table_two, paralytic_final, by = "hospitalization_id", all.x = TRUE)
+analytic_table_three$ethnicity <- relevel(as.factor(analytic_table_one$ethnicity), ref = "Non-Hispanic")
+analytic_table_three$race <- relevel(as.factor(analytic_table_two$race), ref = "White")
+analytic_table_three$sex <- relevel(as.factor(analytic_table_two$sex), ref = "Male")
 
-# Paralyzed
 
-# Deep Sedation Time
+# Fourth Merge with SOFA
+analytic_table_four <- merge(analytic_table_three, sofa_final, by = "hospitalization_id", all.x = TRUE)
+analytic_table_four$ethnicity <- relevel(as.factor(analytic_table_one$ethnicity), ref = "Non-Hispanic")
+analytic_table_four$race <- relevel(as.factor(analytic_table_two$race), ref = "White")
+analytic_table_four$sex <- relevel(as.factor(analytic_table_two$sex), ref = "Male")
+
+
+# Fifth Merge with Hospital ID
+analytic_table_five <- merge(analytic_table_four, hospital_ids_final, by = "hospitalization_id", all.x = TRUE)
+analytic_table_five$ethnicity <- relevel(as.factor(analytic_table_five$ethnicity), ref = "Non-Hispanic")
+analytic_table_five$race <- relevel(as.factor(analytic_table_five$race), ref = "White")
+analytic_table_five$sex <- relevel(as.factor(analytic_table_five$sex), ref = "Male")
+analytic_table_five$hospital_ids <- relevel(as.factor(analytic_table_five$hospital_ids), ref = "HUP")
+
+
+
+# Sixth Merge with Pandemic Admission
+analytic_table_six <- merge(analytic_table_five, pandemic_admissions_final, by = "hospitalization_id", all.x = TRUE)
+analytic_table_six$ethnicity <- relevel(as.factor(analytic_table_six$ethnicity), ref = "Non-Hispanic")
+analytic_table_six$race <- relevel(as.factor(analytic_table_six$race), ref = "White")
+analytic_table_six$sex <- relevel(as.factor(analytic_table_six$sex), ref = "Male")
+analytic_table_six$hospital_ids <- relevel(as.factor(analytic_table_six$hospital_ids), ref = "HUP")
+analytic_table_six$pandemic_admission <- relevel(as.factor(analytic_table_six$pandemic_admission), ref = "FALSE")
+
+
+
+# Seventh Merge with Time to SBT
+analytic_table_seven <- merge(analytic_table_six, first_sbt_calc, by = "hospitalization_id", all.x = TRUE)
+analytic_table_seven$ethnicity <- relevel(as.factor(analytic_table_seven$ethnicity), ref = "Non-Hispanic")
+analytic_table_seven$race <- relevel(as.factor(analytic_table_seven$race), ref = "White")
+analytic_table_seven$sex <- relevel(as.factor(analytic_table_seven$sex), ref = "Male")
+analytic_table_seven$hospital_ids <- relevel(as.factor(analytic_table_seven$hospital_ids), ref = "HUP")
+analytic_table_seven$pandemic_admission <- relevel(as.factor(analytic_table_seven$pandemic_admission), ref = "FALSE")
+
+
+
+# Intersection group
+analytic_table_seven$intersection_group <- interaction(analytic_table_seven$race, analytic_table_seven$sex, analytic_table_seven$ethnicity, drop = TRUE)
+
+# Create a binary outcome for whether time_to_first_sbt is greater than 48 hours
+analytic_table_seven$time_to_first_sbt_48hr <- ifelse(analytic_table_seven$time_to_first_sbt > 48, 1, 0)
+
+# Create a new time variable that is the minimum of time_to_first_sbt and 48 hours
+analytic_table_seven$time_censored <- pmin(analytic_table_seven$time_to_first_sbt, 48)
+
+# Create an event variable that indicates if the event (first SBT) occurred within 48 hours
+analytic_table_seven$event_48hr <- ifelse(analytic_table_seven$time_to_first_sbt <= 48, 1, 0)
+
+# Fit the Cox proportional hazards model with the censored time and event variables
+cox_model_48hr <- coxph(Surv(time_censored, event_48hr) ~ language + age + sex + race + ethnicity + bmi + percent_deep_sedation + paralyzed + total_sofa + hospital_ids + intersection_group,
+                        data = analytic_table_seven)
+
+# View the summary of the model to see hazard ratios
+summary(cox_model_48hr)
+
+
+cox_model_48hr_two <- coxph(Surv(time_censored, event_48hr) ~ language + age + strata(sex) + strata(race) + strata(ethnicity) + bmi + percent_deep_sedation + paralyzed + total_sofa + strata(hospital_ids) + strata(intersection_group) + pandemic_admission,
+                        data = analytic_table_seven)
+
+summary(cox_model_48hr_two)
+
+
+cox_model_interaction <- coxph(Surv(time_censored, event_48hr) ~ age * sex + race + ethnicity + bmi + percent_deep_sedation + paralyzed + total_sofa + hospital_ids + intersection_group,
+                               data = analytic_table_seven)
+summary(cox_model_interaction)
+
+
+
+
+# Load the survival package
+library(survival)
+
+
+# Fit Cox proportional hazards model
+cox_model <- coxph(Surv(time_to_first_sbt) ~ language + age + sex + race + ethnicity + bmi + percent_deep_sedation + paralyzed + total_sofa + hospital_ids, 
+                   data = analytic_table_seven)
+
+
+# View the summary of the model to see hazard ratios
+summary(cox_model)
+
+
+
+
+
+
+library(lme4)
+library(dplyr)
+
+# Create a new column for the intersection group
+analytic_table_seven$intersection_group <- interaction(analytic_table_seven$race, analytic_table_seven$sex, drop = TRUE)
+
+# Step 2: Fit the linear mixed model
+model_fixed <- lm(percent_deep_sedation ~ language + age + bmi + total_sofa + 
+                  sex + race + ethnicity + paralyzed + intersection_group, 
+                  data = analytic_table_six)
+
+# Display model summary
+summary(model_fixed)
+
+
+
+model_random <- lmer(percent_deep_sedation ~ language + ethnicity + age + bmi + total_sofa + (1 | intersection_group), 
+              data = analytic_table_six)
+
+summary(model_random)
+
+
+
+
+library(lme4)
+library(sjPlot)
+
+# Create a new column for the intersection group
+analytic_table_six$intersection_group <- interaction(analytic_table_six$race, analytic_table_six$ethnicity, 
+                                                     analytic_table_six$sex, 
+                                                     drop = TRUE)
+
+# Fit the MAIHDA model
+model_maihda <- lmer(percent_deep_sedation ~ language + age + bmi + total_sofa + sex + race + ethnicity + paralyzed + hospital_ids + pandemic_admission + (1 | intersection_group),
+                     data = analytic_table_six)
+
+# Display model summary
+summary(model_maihda)
+
+# Plot random effects for intersection groups
+plot_model(model_maihda, type = "re", show.values = TRUE)
+
+
+
+library(ggplot2)
+
+# Example ggplot
+ggplot(analytic_table_six, aes(x = age, y = percent_deep_sedation)) + 
+  geom_point() + 
+  theme_minimal()
+
+
+print(ggplot2)
+
+
+
+library(lme4)
+random_effects <- ranef(your_model)$intersection_group
+
+spanish_effects <- random_effects + fixef(your_model)["languageSpanish"]
+
+
+
+
+
+# Fit the linear regression model
+model <- lm(percent_deep_sedation ~ language, data = analytic_table_one)
+
+# View the summary of the model
+summary(model)
+
+
+# Fit #2
+model2 <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race, data = analytic_table_one)
+
+summary(model2)
+
+
+#Fit #3
+model3 <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race + bmi, data = analytic_table_two)
+
+summary(model3)
+
+#Fit #4
+model4 <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race + bmi + paralyzed, data = analytic_table_three)
+
+summary(model4)
+
+
+#Fit #5
+model5 <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa, data = analytic_table_four)
+
+summary(model5)
+
+
+
+#Fit #6
+model6 <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_ids, data = analytic_table_five)
+
+summary(model6)
+
+
+#Fit #7
+model7 <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_ids + pandemic_admission, data = analytic_table_six)
+
+summary(model7)
+
+
+
+#Fit #8
+
+# Convert categorical columns to factors if they aren’t already
+analytic_table_six[, language := factor(language)]
+analytic_table_six[, sex := factor(sex)]
+analytic_table_six[, ethnicity := factor(ethnicity)]
+analytic_table_six[, race := factor(race)]
+analytic_table_six[, hospital_ids := factor(hospital_ids)]
+
+# Use the updated data in the model
+model8 <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_ids + pandemic_admission + intersection_group, data = analytic_table_six)
+
+summary(model8)
+
+
+
+#Fit #9
+# Remove rows with any missing values in analytic_table_six
+analytic_table_six_clean <- na.omit(analytic_table_six)
+
+# Create dummy variables for the cleaned data
+analytic_table_six_dummies <- as.data.frame(model.matrix(~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_ids + pandemic_admission - 1, 
+                                                        data = analytic_table_six_clean))
+
+# Add the response variable back to the dummy data frame
+analytic_table_six_dummies$percent_deep_sedation <- analytic_table_six_clean$percent_deep_sedation
+
+# Now fit the model
+model7_dummies <- lm(percent_deep_sedation ~ ., data = analytic_table_six_dummies)
+
+# View the summary
+summary(model7_dummies)
+
+
+black_hispanic_count <- analytic_table_one[race == "Black or African American" & ethnicity == "Hispanic", .N]
+
+
+other_hispanic_count <- analytic_table_one[race == "Other" & ethnicity == "Hispanic", .N]
+# 105
+
+other_count <- analytic_table_one[race == "Other", .N]
+
+# Subset data to only include Hispanic patients
+hispanic_data <- analytic_table_six[ethnicity == "Hispanic"]
+hispanic_data$race <- relevel(as.factor(hispanic_data$race), ref = "White")
+hispanic_data$sex <- relevel(as.factor(hispanic_data$sex), ref = "Male")
+hispanic_data$hospital_ids <- relevel(as.factor(hispanic_data$hospital_ids), ref = "HUP")
+hispanic_data$pandemic_admission <- relevel(as.factor(hispanic_data$pandemic_admission), ref = "FALSE")
+
+# Fit a linear model for Hispanic patients, excluding ethnicity
+model_hispanic <- lm(percent_deep_sedation ~ language + age + sex + race + bmi + paralyzed + total_sofa + hospital_ids + pandemic_admission, data = hispanic_data)
+
+# Summarize the model
+summary(model_hispanic)
+
+
+
+
+# Subset data to only include Asian patients
+asian_data <- analytic_table_five[race == "Asian"]
+
+# Fit a linear model for Hispanic patients, excluding ethnicity
+model_asian <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + bmi + paralyzed + total_sofa + hospital_ids, data = asian_data)
+
+# Summarize the model
+summary(model_asian)
+
+
+
+# Subset data to only include Asian patients
+black_data <- analytic_table_five[race == "Black or African American"]
+
+# Fit a linear model for Hispanic patients, excluding ethnicity
+model_black <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + paralyzed + total_sofa + hospital_ids, data = black_data)
+
+# Summarize the model
+summary(model_black)
+
+
+
+
+
+# Assuming 'language' and 'paralyzed' are columns in your data
+contingency_table <- table(analytic_table_four$language, analytic_table_four$paralyzed)
+print(contingency_table)
+
+# Perform the Chi-squared test
+chi_squared_test <- chisq.test(contingency_table)
+print(chi_squared_test)
+
+
 
 
 
 ```
+
+
+```{R}
+
+analytic_table_six_known <- analytic_table_six %>%
+  filter(race != "Unknown", 
+         ethnicity != "Unknown", 
+         language != "Unknown") 
+
+
+analytic_table_six_known$intersection_group_known <- interaction(analytic_table_six_known$race, analytic_table_six_known$ethnicity, 
+                                                     analytic_table_six_known$sex, 
+                                                     drop = TRUE)
+
+
+library(lme4)
+library(sjPlot)
+library(dplyr)
+library(tibble)
+
+# Create a new column for the intersection group
+analytic_table_six_known$intersection_group_known <- interaction(analytic_table_six_known$race, analytic_table_six_known$ethnicity, 
+                                                     analytic_table_six_known$sex, drop = TRUE)
+
+# Fit the MAIHDA model
+model_maihda_known <- lmer(percent_deep_sedation ~ language + age + bmi + total_sofa + (1 | intersection_group_known), 
+                     data = analytic_table_six_known)
+
+# Display model summary
+summary(model_maihda_known)
+
+# Plot random effects for intersection groups
+plot_model(model_maihda_known, type = "re", show.values = TRUE)
+
+# 1. Extract random effects for each intersection group
+random_effects_known <- ranef(model_maihda_known)$intersection_group
+
+# Convert random effects to a data frame for manipulation
+random_effects_df_known <- as.data.frame(random_effects_known) %>%
+  rownames_to_column("intersection_group") %>%
+  rename(random_intercept = `(Intercept)`)
+
+# 2. Calculate the predicted effects of Spanish and Other Language by adding their fixed effect to each group's random intercept
+spanish_effect_known <- fixef(model_maihda_known)["languageSpanish"]
+other_lang_effect_known <- fixef(model_maihda_known)["languageOther Language"]
+
+# Add language-specific effects to random intercepts
+random_effects_df_known <- random_effects_df_known %>%
+  mutate(spanish_pred_known = random_intercept + spanish_effect_known,
+         other_lang_pred_known = random_intercept + other_lang_effect_known)
+
+# 3. Identify and visualize groups with the strongest language effects
+# Sort by Spanish and Other Language effects to see most affected groups
+most_affected_by_spanish_known <- random_effects_df_known %>% arrange(desc(spanish_pred_known))
+most_affected_by_other_known <- random_effects_df_known %>% arrange(desc(other_lang_pred_known))
+
+# View top affected groups
+head(most_affected_by_spanish_known)
+head(most_affected_by_other_known)
+
+# 4. Optional: Plot the results
+# Plot the predicted effects for Spanish across intersection groups
+library(ggplot2)
+ggplot(random_effects_df_known, aes(x = reorder(intersection_group, spanish_pred_known), y = spanish_pred_known)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Predicted Percent Deep Sedation for Spanish Speakers by Intersection Group",
+       x = "Intersection Group", y = "Predicted Percent Deep Sedation")
+
+# Plot the predicted effects for Other Language across intersection groups
+ggplot(random_effects_df, aes(x = reorder(intersection_group, other_lang_pred), y = other_lang_pred)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Predicted Percent Deep Sedation for Other Language Speakers by Intersection Group",
+       x = "Intersection Group", y = "Predicted Percent Deep Sedation")
+
+
+
+
+
+
+```
+
+```{R}
+
+# Analyzing UnParalyzed Demographics:
+weight_hosp_ids
+
+# Age at Admission
+age_at_admission_unparalyzed <- hospitalization[hospitalization_id %in% unparalyzed_hospital_ids, .(patient_id, hospitalization_id, age_at_admission)]
+
+pat_id_final_unparalyzed <- unique(age_at_admission_unparalyzed$patient_id)
+
+# Clean version of Patient Table
+patient_clean_unparalyzed <- patient[patient_id %in% pat_id_final_unparalyzed]
+
+# Merge Patient and Age at Admission
+
+demographics_unparalyzed <- merge(age_at_admission_unparalyzed, patient_clean_unparalyzed, by = "patient_id", all.x = TRUE)
+demographics_unparalyzed <- demographics_unparalyzed[, .(hospitalization_id, race_category, ethnicity_category, sex_category, language_name, age_at_admission)]
+demographics_unparalyzed[, language_category := fifelse(language_name == "English", "English",
+                         fifelse(language_name == "Spanish", "Spanish",
+                         fifelse(language_name %in% c("Other", "Unknown", "Patient Declined", ""), "Unknown",                          "Other Language")))]
+
+
+
+
+rass_percentages_unparalyzed <- rass_percentages[hospitalization_id %in% unparalyzed_hospital_ids]
+
+admission_bmi_unparalyzed <- admission_bmi_final[hospitalization_id %in% unparalyzed_hospital_ids]
+
+sofa_final_unparalyzed <- sofa_final[hospitalization_id %in% unparalyzed_hospital_ids]
+
+hospital_ids_unparalyzed <- hospital_ids_final[hospitalization_id %in% unparalyzed_hospital_ids]
+
+
+
+# First Merge Demographics and RASS Percent
+analytic_table_one_unparalyzed <- merge(demographics_unparalyzed, rass_percentages_unparalyzed, by = "hospitalization_id", all.x = TRUE)
+setnames(analytic_table_one_unparalyzed, 
+         old = c("race_category", "ethnicity_category", "sex_category", "language_category", "age_at_admission"), 
+         new = c("race", "ethnicity", "sex", "language", "age"))
+analytic_table_one_unparalyzed$ethnicity <- relevel(as.factor(analytic_table_one_unparalyzed$ethnicity), ref = "Non-Hispanic")
+
+
+
+
+# Second Merge with BMI
+analytic_table_two_unparalyzed <- merge(analytic_table_one_unparalyzed, admission_bmi_final, by = "hospitalization_id", all.x = TRUE)
+analytic_table_two_unparalyzed$ethnicity <- relevel(as.factor(analytic_table_two_unparalyzed$ethnicity), ref = "Non-Hispanic")
+analytic_table_two_unparalyzed$race <- relevel(as.factor(analytic_table_two_unparalyzed$race), ref = "White")
+analytic_table_two_unparalyzed$sex <- relevel(as.factor(analytic_table_two_unparalyzed$sex), ref = "Male")
+
+
+# Third merge with SOFA
+analytic_table_four_unparalyzed <- merge(analytic_table_two_unparalyzed, sofa_final, by = "hospitalization_id", all.x = TRUE)
+analytic_table_four_unparalyzed$ethnicity <- relevel(as.factor(analytic_table_four_unparalyzed$ethnicity), ref = "Non-Hispanic")
+analytic_table_four_unparalyzed$race <- relevel(as.factor(analytic_table_four_unparalyzed$race), ref = "White")
+analytic_table_four_unparalyzed$sex <- relevel(as.factor(analytic_table_four_unparalyzed$sex), ref = "Male")
+
+
+# Fifth Merge with Hospital ID
+analytic_table_five_unparalyzed <- merge(analytic_table_four_unparalyzed, hospital_ids_final, by = "hospitalization_id", all.x = TRUE)
+analytic_table_five_unparalyzed$ethnicity <- relevel(as.factor(analytic_table_five_unparalyzed$ethnicity), ref = "Non-Hispanic")
+analytic_table_five_unparalyzed$race <- relevel(as.factor(analytic_table_five_unparalyzed$race), ref = "White")
+analytic_table_five_unparalyzed$sex <- relevel(as.factor(analytic_table_five_unparalyzed$sex), ref = "Male")
+analytic_table_five_unparalyzed$hospital_ids <- relevel(as.factor(analytic_table_five_unparalyzed$hospital_ids), ref = "HUP")
+
+
+
+
+
+# Fit the linear regression model
+model <- lm(percent_deep_sedation ~ language, data = analytic_table_one_unparalyzed)
+
+# View the summary of the model
+summary(model)
+
+# Fit Again
+model2 <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race, data = analytic_table_one_unparalyzed)
+
+summary(model2)
+
+
+
+
+#Fit #3
+model3_unparalyzed <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race + bmi, data = analytic_table_two_unparalyzed)
+
+summary(model3_unparalyzed)
+
+
+#Fit #5
+model5_unparalyzed <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race + bmi + total_sofa, data = analytic_table_four_unparalyzed)
+
+summary(model5_unparalyzed)
+
+
+
+#Fit #6
+model6_unparalyzed <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race + bmi + total_sofa + hospital_ids, data = analytic_table_five_unparalyzed)
+
+summary(model6_unparalyzed)
+
+
+
+```
+
 
 # DEBUGGING
 
@@ -1112,3 +2212,12 @@ hosp_clean_weight_height[, end_time := ifelse(total_imv_time >= 72,
 # Step 3: Filter the table to retain rows where recorded_dttm is within the time range
 weight_height_filt <- hosp_clean_weight_height[recorded_dttm >= start_time & recorded_dttm <= end_time]
 weight_height_filt <- weight_height_filt[, .(hospitalization_id, recorded_dttm, weight_kg, height_cm)]
+
+
+
+# Debugging: View data for a specific hospitalization_id
+hospitalization_id_to_view <- "295559562" 
+repeat_hosp_data_special <- rass_timeline_clean[hospitalization_id == hospitalization_id_to_view]
+
+rass_hosp_specific <- rass_hosp_final[hospitalization_id == hospitalization_id_to_view]
+

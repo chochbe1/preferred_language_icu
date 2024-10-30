@@ -5,7 +5,7 @@
 
 # Install Packages
 
-packages <- c("zoo", "data.table", "dplyr", "lubridate")
+packages <- c("zoo", "data.table", "dplyr", "lubridate", "lme4", "sjPlot")
 install_if_missing <- function(package) {
   if (!require(package, character.only = TRUE)) {
     install.packages(package, dependencies = TRUE)
@@ -20,6 +20,8 @@ library(data.table)
 library(dplyr)
 library(zoo)  # for na.locf function
 library(lubridate)
+library(lme4)
+library(sjPlot)
 
 ```
 
@@ -552,24 +554,24 @@ paralytic_final <- paralytic_clean[, .(hospitalization_id, paralyzed)]
 ```{R}
 
 # STEP 1: Filter previous RASS table only for those with clean hospitalization ids
-pat_assess_rass_filt <- pat_assess_rass[hospitalization_id %in% hosp_id_rass_clean]
+pat_assess_rass_clean <- pat_assess_rass[hospitalization_id %in% hosp_id_vitals_clean]
 setorder(pat_assess_rass_filt, hospitalization_id, recorded_dttm)
 
 
 # STEP 2: Reshape the data to spread RASS into a column
-pat_assess_rass <- dcast(pat_assess_rass, 
+pat_assess_rass_clean <- dcast(pat_assess_rass_clean, 
                    hospitalization_id + recorded_dttm ~ assessment_category, 
                    value.var = "numerical_value", 
                    fun.aggregate = mean,  # Aggregate duplicates using mean
                    fill = NA)  # Fill missing values with NA
-pat_assess_rass <- pat_assess_rass[, .(hospitalization_id, recorded_dttm, RASS)]
+pat_assess_rass_clean <- pat_assess_rass_clean[, .(hospitalization_id, recorded_dttm, RASS)]
 
 
 # STEP 3: Merge Hosp Time Clean with RASS
-rass_hosp_clean <- merge(hosp_rass_clean, pat_assess_rass, by = "hospitalization_id", all.x = TRUE)
+rass_hosp_clean <- merge(hosp_clean_time, pat_assess_rass_clean, by = "hospitalization_id", all.x = TRUE)
 
 
-# STEP 4: Merge with Timeline
+# STEP 4: Merge with Timeline to give additional data points for filling
 rass_timeline <- merge(hosp_clean_timeline, rass_hosp_clean, by = c("hospitalization_id", "recorded_dttm"), 
                          all = TRUE)
 

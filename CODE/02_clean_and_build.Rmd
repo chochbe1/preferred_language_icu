@@ -1,0 +1,866 @@
+
+# Setup Step: Setup libraries
+```{r}
+
+# Install Packages
+
+packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr")
+install_if_missing <- function(package) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package, dependencies = TRUE)
+    library(package, character.only = TRUE)
+  }
+}
+ 
+sapply(packages, install_if_missing)
+
+# Load necessary libraries
+library(data.table)
+library(dplyr)
+library(zoo)  # for na.locf function
+library(lubridate)
+library(tidyr)
+
+```
+
+# PART ONE:
+# ***Define directories for the rest of the script
+# ***Upload Necessary Tables
+
+```{r}
+# Define the Directory Where Existing CLIF Tables are Located
+data_dir <- "/share/projects/data/circe/v20240931a/clif/" # Add your directory information here
+
+# Define the Directory where Intermediate and Final Tables will be saved
+output_dir <- "/share/projects/data/circe/v20240931a/clif/sedation_project/" # Add your output information here
+
+# Add your File Type here:
+
+
+# Add your institution here
+Institution <- "Penn" # Add your institution here
+
+# Upload Part One Data Table
+part_one_data <- fread(paste0(output_dir, "imv_runs.csv.gz"))
+part_one_hosp_id <- unique(part_one_data$hospitalization_id)
+
+
+# STEP 1: Load Patient Assessments For Hospitalization_IDs above
+patient_assessments <- fread(paste0(data_dir, "patient_assessments.csv.gz"), 
+                             select = c("hospitalization_id", "recorded_dttm", "assessment_category", "numerical_value"))[hospitalization_id %in% part_one_hosp_id]
+
+
+# STEP 2: Upload CLIF Vitals 
+specific_vital_categories <- c("sbp", "dbp", "height_cm", "weight_kg")  # Replace with your actual categories
+
+vitals <- fread(paste0(data_dir, "vitals.csv.gz"), 
+  select = c("hospitalization_id", "recorded_dttm", "vital_category", "vital_value")
+)[hospitalization_id %in% part_one_hosp_id & vital_category %in% specific_vital_categories]
+
+
+# STEP 3: Upload CLIF Labs
+# Labs Table Conversion to recorded_dttm
+# Using Lab Collect DTTM as the marker instead of order or result
+specific_lab_categories <- c("creatinine", "total_bilirubin", "platelet_count", "po2_arterial")
+labs <- fread(paste0(data_dir,"labs.csv.gz"), select = c("hospitalization_id", "lab_collect_dttm", "lab_category", "lab_value_numeric"))[hospitalization_id %in% part_one_hosp_id & lab_category %in% specific_lab_categories]
+setorder(labs, hospitalization_id, lab_collect_dttm)
+setnames(labs, "lab_collect_dttm", "recorded_dttm")
+
+# STEP 4: Upload CLIF Continuous Meds
+# Upload CLIF Continuous Meds
+meds <- fread(paste0(data_dir,"medication_admin_continuous.csv.gz"))[hospitalization_id %in% part_one_hosp_id]
+
+
+# STEP 5: Upload CLIF ADT Table
+adt <- fread(paste0(data_dir,"adt.csv.gz"))[hospitalization_id %in% part_one_hosp_id]
+
+
+# STEP 6: Upload CLIF Hospitalization Table
+hospitalization <- fread(paste0(data_dir, "hospitalization.csv.gz"), select = c("patient_id", "hospitalization_id", "age_at_admission"))[hospitalization_id %in% part_one_hosp_id]
+hospitalization <- unique(hospitalization, by = "hospitalization_id")
+
+
+# STEP 7: Upload CLIF Patient Table
+patient <- fread(paste0(data_dir,"patient.csv.gz"))
+
+
+# STEP 8: Upload CLIF Respiratory Support
+respiratory_support <- fread(paste0(data_dir, "respiratory_support.csv.gz"), select = c("hospitalization_id", "recorded_dttm", "fio2_set"))[hospitalization_id %in% part_one_hosp_id]
+
+```
+
+
+# PART TWO: Filter out hospitalizations with RASS issues
+# ***Identify earliest RASS timepoint
+# ***Flag hospitalizations with missing RASS values between 2 hours before and 8 hours after IMV
+```{r}
+
+# STEP 1: Form RASS Specific Patient Assessment Table
+pat_assess_rass <- patient_assessments[assessment_category == "RASS"]
+setorder(pat_assess_rass, hospitalization_id, recorded_dttm)
+
+
+# STEP 2: Identify first RASS Timepoint
+pat_first_rass <- pat_assess_rass[, .(first_rass_dttm = min(recorded_dttm)), by = hospitalization_id]
+
+
+# STEP 3: Merge part_one_data with RASS
+hosp_time_rass <- merge(part_one_data, pat_first_rass, by = "hospitalization_id", all = TRUE)
+
+
+# STEP 4: Calculate time between first RASS and beginning mechanical ventilation
+hosp_time_rass[, time_to_first_rass := as.numeric(difftime(first_rass_dttm, begin_imv, units = "hours"))]
+
+
+# STEP 5: Filter Out Hospitalizations with >8 hours or more gap between begin IMV and first RASS as well as those with no RASS values
+hosp_rass_clean <- hosp_time_rass[!is.na(time_to_first_rass) & time_to_first_rass < 8]
+
+hosp_id_rass_clean <- unique(hosp_rass_clean$hospitalization_id)
+pat_id_rass_clean <- unique(hosp_rass_clean$patient_id)
+
+```
+
+
+# PART THREE: Filter out hospitalizations with missing vitals information
+# *** Calculate BMI
+# *** Filter out hospitalizations without BMI data
+```{r}
+
+# STEP 1: Create weight / height vitals only table
+vitals_weight_height <- vitals[vital_category %in% c("weight_kg", "height_cm")]
+
+
+# STEP 2: Reshape the data to put weight into separate columns, using 'mean' to handle duplicates
+vitals_weight_height <- dcast(vitals_weight_height, 
+                   hospitalization_id + recorded_dttm ~ vital_category, 
+                   value.var = "vital_value", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+vitals_weight_height <- vitals_weight_height[, .(hospitalization_id, recorded_dttm, weight_kg, height_cm)]
+setorder(vitals_weight_height, hospitalization_id, recorded_dttm)
+
+# STEP 3: Filter Out improbably low weights and select first weight
+admission_weights <- vitals_weight_height[
+  weight_kg >= 40,  # Filter out extreme values
+  .(admission_weight = weight_kg[1]),  # Select the first weight for each group
+  by = hospitalization_id
+]
+
+# STEP 4: Filter Out Improbably low heights and select first height
+admission_heights <- vitals_weight_height[
+  height_cm >= 100,  # Filter out extreme values
+  .(admission_height = height_cm[1]),  # Select the first height for each group
+  by = hospitalization_id
+]
+
+# STEP 5: Calculate BMI
+admission_bmi <- merge(admission_weights, admission_heights, by = "hospitalization_id", all = TRUE)
+admission_bmi[, height_m := admission_height / 100]
+admission_bmi[, bmi := admission_weight / (height_m^2)]
+
+admission_bmi <- admission_bmi[!is.na(bmi) & bmi != ""]
+admission_bmi_final <- admission_bmi[bmi >= 12 & bmi <= 80]
+admission_bmi_final <- admission_bmi_final[, .(hospitalization_id, bmi)]
+
+hosp_id_vitals_clean <- unique(admission_bmi_final$hospitalization_id)
+```
+
+
+
+# PART FOUR: Define Clean Tables
+# ***Clean part one data for only hospital ids that made it through cleaning in PART TWO and PART THREE
+# ***Establish timeline for each hospitalization_id around their IMV times
+```{r}
+
+# STEP 1: Clean Part One Data so it only has hospitalization_ids identified after cleaning steps
+part_one_data_clean <- part_one_data[hospitalization_id %in% hosp_id_vitals_clean]
+
+
+
+# STEP 2: Expand table to create 15-min increments from 24 hours before mechanical ventilation to 48 hours after mechanical ventilation for all hospitalization_ids
+hosp_clean_timeline <- part_one_data_clean[, .(recorded_dttm = seq(
+                                          from = as.POSIXct(min(begin_imv)) - hours(24), 
+                                          to = as.POSIXct(min(begin_imv) + hours(48)),
+                                          by = "15 min")), 
+                                  by = .(hospitalization_id)]
+```
+
+
+# PART FIVE: Build RASS Percentage Table
+# ***Use LOCF Logic to fill out RASS scores for the first 48 hours of mechanical ventilation
+# ***Calculate the precent time spent in deep sedation (defined as a RASS score less than or equal to -3)
+```{r}
+# STEP 1: Filter previous RASS table only for those with clean hospitalization ids
+pat_assess_rass_clean <- pat_assess_rass[hospitalization_id %in% hosp_id_vitals_clean]
+setorder(pat_assess_rass_clean, hospitalization_id, recorded_dttm)
+
+
+# STEP 2: Reshape the data from long to wide
+pat_assess_rass_clean <- dcast(pat_assess_rass_clean, 
+                   hospitalization_id + recorded_dttm ~ assessment_category, 
+                   value.var = "numerical_value", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+pat_assess_rass_clean <- pat_assess_rass_clean[, .(hospitalization_id, recorded_dttm, RASS)]
+
+
+# STEP 3: Merge with Timeline to give additional data points for filling
+rass_timeline <- merge(hosp_clean_timeline, pat_assess_rass_clean, by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+# STEP 4: Merge Clean Part One Data with RASS
+rass_timeline_clean <- merge(part_one_data_clean, rass_timeline, by = "hospitalization_id", all.x = TRUE)
+
+
+# STEP 5: Use LOCF to fill in missing RASS Data
+rass_timeline_clean[RASS == "", RASS := NA]
+rass_timeline_clean[, RASS := na.locf(RASS, na.rm = FALSE), by = hospitalization_id]
+
+
+# STEP 6: Filter only for values between begin_imv and 48 hours after IMV (or if extubated/expired before 48 hours then however long they were ventilated for)
+# Calculate start_time
+rass_timeline_clean[, start_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Calculate end_time based on the condition for each hospitalization_id
+rass_timeline_clean[, end_time := ifelse(total_imv_time >= 48, 
+                                         as.POSIXct(begin_imv) + hours(48),  
+                                         as.POSIXct(end_imv)), 
+                     by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+rass_hosp_filt <- rass_timeline_clean[recorded_dttm >= start_time & recorded_dttm <= end_time]
+
+# Final filtered table with relevant columns
+rass_hosp_final <- rass_hosp_filt[, .(hospitalization_id, recorded_dttm, begin_imv, RASS)]
+
+
+# STEP 7: Flag patients with RASS scores of -3 or lower as deep sedation
+rass_hosp_final[, deep_sedation := RASS <= -3]
+
+
+# STEP 8: Calculate total time for each hospitalization_id
+rass_hosp_final[, time_total := as.numeric(difftime(max(recorded_dttm), min(recorded_dttm), units = "hours")), 
+               by = hospitalization_id]
+
+
+# STEP 9: Calculate the time spent in deep sedation (deep_sedation == TRUE)
+rass_hosp_final[, time_deep_sedation := sum(as.numeric(difftime(shift(recorded_dttm, type = "lead"), recorded_dttm, units = "hours")) * deep_sedation, na.rm = TRUE), 
+               by = hospitalization_id]
+
+
+# STEP 10: # Calculate the percent of time in deep sedation
+rass_hosp_final[, percent_deep_sedation := (time_deep_sedation / time_total) * 100]
+
+
+# STEP 11: Final Table
+rass_percentages <- rass_hosp_final[, .(percent_deep_sedation = mean(percent_deep_sedation, na.rm = TRUE)), 
+                                  by = hospitalization_id]
+
+```
+
+
+# PART SIX: Identify Paralyzed Patients
+# ***Identify all patients receiving continuous paralytics within the first 48 hours of mechanical ventilation
+```{r}
+
+# STEP 1: Filter only for paralytic meds
+meds_paralytics <- meds[med_group == "paralytics"]
+
+
+# STEP 2: Filter only for doses >0
+meds_paralytics_filtered <- meds_paralytics[med_dose > 0]
+
+
+# STEP 3: Identify earliest admin_dttm for doses >0 for each hospitalization
+earliest_paralytics <- meds_paralytics[, .(earliest_paralytic_dttm = min(admin_dttm)), by = hospitalization_id]
+
+
+# STEP 4: Merge with clean part one data for filtering
+paralytic_clean <- merge(part_one_data_clean, earliest_paralytics, by = "hospitalization_id", all.x = TRUE)
+
+
+# STEP 5: Identify patients paralyzed within first 48 hours after beginning mechanical ventilation
+paralytic_clean[, paralyzed := as.logical(abs(difftime(earliest_paralytic_dttm, begin_imv, units = "hours")) <= 48)]
+
+
+# STEP 6: Fill Table Out and Choose Only hospitalization and paralytic data
+paralytic_clean[, paralyzed := fifelse(is.na(paralyzed) | paralyzed == "", FALSE, paralyzed)]
+paralytic_final <- paralytic_clean[, .(hospitalization_id, paralyzed)]
+
+```
+
+# PART SEVEN: Identify Hospital IDs for the hospitalizations in question
+```{R}
+
+# STEP 1: Clean ADT Table only for clean hospital ids
+adt_clean <- adt[hospitalization_id %in% hosp_id_vitals_clean]
+setorder(adt_clean, hospitalization_id, in_dttm)
+
+
+# STEP 2: Merge with clean part one data to help identify hospital at time of ventilation
+adt_clean_merge <- merge(adt_clean, part_one_data_clean, by = "hospitalization_id", all.x = TRUE)
+
+
+# STEP 3: Flag rows where begin_imv is between in_dttm and out_dttm
+adt_clean_merge[, imv_hospital_id := begin_imv >= in_dttm & begin_imv <= out_dttm]
+
+
+# STEP 4: Filter rows where the imv_hospital_id is TRUE
+filtered_data <- adt_clean_merge[imv_hospital_id == TRUE]
+
+
+# STEP 5: Select the first row for each hospitalization_id
+hospital_id_final <- filtered_data[, .SD[1], by = hospitalization_id]
+hospital_id_final <- hospital_id_final[, .(hospitalization_id, hospital_id)]
+
+
+```
+
+
+# PART EIGHT: Demographics Table
+```{r}
+# Age at Admission
+age_at_admission <- hospitalization[hospitalization_id %in% hosp_id_vitals_clean, .(patient_id, hospitalization_id, age_at_admission)]
+
+pat_id_final <- unique(age_at_admission$patient_id)
+
+# Clean version of Patient Table
+patient_clean <- patient[patient_id %in% pat_id_final]
+
+# Merge Patient and Age at Admission
+
+demographics <- merge(age_at_admission, patient_clean, by = "patient_id", all.x = TRUE)
+demographics <- demographics[, .(hospitalization_id, race_category, ethnicity_category, sex_category, language_name, age_at_admission)]
+demographics[, language_category := fifelse(language_name == "English", "English",
+                         fifelse(language_name == "Spanish", "Spanish",
+                         fifelse(language_name %in% c("Other", "Unknown", "Patient Declined", ""), "Unknown", 
+                         "Other Language")))]
+```
+
+
+# PART NINE: Calculate SOFA Scores
+
+```{R}
+# Develop Data Tables Needed for SOFA Score Tabulation
+
+# STEP 1: MAP Table
+# Filter for SBP, DBP, and MAP values in vital_category
+vitals_bp <- vitals[vital_category %in% c("sbp", "dbp", "map")]
+
+# Reshape the data to spread sbp, dbp, and map into separate columns, using 'mean' to handle duplicates
+vitals_bp <- dcast(vitals_bp, 
+                   hospitalization_id + recorded_dttm ~ vital_category, 
+                   value.var = "vital_value", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+vitals_bp <- vitals_bp[, .(hospitalization_id, recorded_dttm, sbp, dbp)]
+setorder(vitals_bp, hospitalization_id, recorded_dttm)
+
+# Calculate MAP
+vitals_bp[, map := (1/3 * sbp) + (2/3 * dbp)]
+
+map_table <- vitals_bp[, .(hospitalization_id, recorded_dttm, map)]
+
+# Merge with clean part one data table for time filtering
+map_table_merge <- merge(part_one_data_clean, map_table, by = "hospitalization_id", all.x = TRUE)
+
+#TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+map_table_merge[, start_time := as.POSIXct(begin_imv) - hours(24), by = hospitalization_id]
+
+# Calculate end_time based on the condition for each hospitalization_id
+map_table_merge[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+map_table_filt <- map_table_merge[recorded_dttm >= start_time & recorded_dttm <= end_time]
+map_table_final <- map_table_filt[, .(hospitalization_id, recorded_dttm, map)]
+
+
+# STEP 2: P/F Table
+#FiO2 Values
+resp_supp_fio2 <- respiratory_support[hospitalization_id %in% hosp_id_rass_clean]
+resp_supp_fio2 <- resp_supp_fio2[, .(hospitalization_id, recorded_dttm, fio2_set)]
+
+#PaO2 Lab Values
+labs_pao2 <- labs[lab_category %in% c("po2_arterial")]
+labs_pao2 <- labs_pao2[, .(hospitalization_id, recorded_dttm, lab_category, lab_value_numeric)]
+setorder(labs_pao2, hospitalization_id, recorded_dttm)
+
+# Reshape the data to spread pao2 into a column, using 'mean' to handle duplicates
+labs_pao2 <- dcast(labs_pao2, 
+                   hospitalization_id + recorded_dttm ~ lab_category, 
+                   value.var = "lab_value_numeric", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+labs_pao2 <- labs_pao2[, .(hospitalization_id, recorded_dttm, po2_arterial)]
+
+
+#Merge fio2 and clean part one data for time filtering
+fio2_hosp_clean <- merge(part_one_data_clean, resp_supp_fio2, by = "hospitalization_id", all.x =TRUE)
+
+#Merge pao2 and clean part one data for time filtering
+pao2_hosp_clean <- merge(part_one_data_clean, labs_pao2, by = "hospitalization_id", all.x =TRUE)
+
+#TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+fio2_hosp_clean[, start_time := as.POSIXct(begin_imv) - hours(24), by = hospitalization_id]
+pao2_hosp_clean[, start_time := as.POSIXct(begin_imv) - hours(24), by = hospitalization_id]
+
+# Calculate end_time based on the condition for each hospitalization_id
+fio2_hosp_clean[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+pao2_hosp_clean[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+pao2_hosp_filt <- pao2_hosp_clean[recorded_dttm >= start_time & recorded_dttm <= end_time]
+fio2_hosp_filt <- fio2_hosp_clean[recorded_dttm >= start_time & recorded_dttm <= end_time]
+pao2_hosp_filt <- pao2_hosp_filt[, .(hospitalization_id, recorded_dttm, po2_arterial)]
+fio2_hosp_filt <- fio2_hosp_filt[, .(hospitalization_id, recorded_dttm, fio2_set)]
+
+# Merge
+pao2_fio2_merge <- merge(fio2_hosp_filt, pao2_hosp_filt, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+#Use LOCF to Fill Out fio2 and po2_arterial columns
+pao2_fio2_merge[fio2_set == "", fio2_set := NA]
+pao2_fio2_merge[po2_arterial == "", po2_arterial := NA]
+pao2_fio2_merge[, fio2_set := na.locf(fio2_set, na.rm = FALSE), by = hospitalization_id]
+pao2_fio2_merge[, po2_arterial := na.locf(po2_arterial, na.rm = FALSE), by = hospitalization_id]
+
+#Prepare FiO2 for P/F
+pao2_fio2_merge[, fio2_calc := fifelse(fio2_set <= 1, fio2_set, fio2_set / 100)]
+
+# Calculate P to F Ratio
+pao2_fio2_merge[, p_to_f := po2_arterial / fio2_calc]
+pao2_fio2_sofa <- pao2_fio2_merge[, .(hospitalization_id, recorded_dttm, p_to_f)]
+
+
+# STEP 3: Creatinine Table
+# Creatinine Lab Values
+labs_cr <- labs[lab_category %in% c("creatinine")]
+labs_cr <- labs_cr[, .(hospitalization_id, recorded_dttm, lab_category, lab_value_numeric)]
+setorder(labs_cr, hospitalization_id, recorded_dttm)
+
+# Reshape the data to spread cr into a column, using 'mean' to handle duplicates
+labs_cr <- dcast(labs_cr, 
+                   hospitalization_id + recorded_dttm ~ lab_category, 
+                   value.var = "lab_value_numeric", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+labs_cr <- labs_cr[, .(hospitalization_id, recorded_dttm, creatinine)]
+
+#Merge cr and clean data from part one for time filtering
+cr_hosp_clean <- merge(part_one_data_clean, labs_cr, by = "hospitalization_id", all.x =TRUE)
+
+#TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+cr_hosp_clean[, start_time := as.POSIXct(begin_imv) - hours(24), by = hospitalization_id]
+
+# Calculate end_time based on the condition for each hospitalization_id
+cr_hosp_clean[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+cr_hosp_filt <- cr_hosp_clean[recorded_dttm >= start_time & recorded_dttm <= end_time]
+cr_hosp_filt <- cr_hosp_filt[, .(hospitalization_id, recorded_dttm, creatinine)]
+
+
+# STEP 4: Total Bilirubin Table
+#Bilirubin Lab Values
+labs_bili <- labs[lab_category %in% c("bilirubin_total")]
+labs_bili <- labs_bili[, .(hospitalization_id, recorded_dttm, lab_category, lab_value_numeric)]
+setorder(labs_bili, hospitalization_id, recorded_dttm)
+
+# Reshape the data to spread bili into a column, using 'mean' to handle duplicates
+labs_bili <- dcast(labs_bili, 
+                   hospitalization_id + recorded_dttm ~ lab_category, 
+                   value.var = "lab_value_numeric", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+labs_bili <- labs_bili[, .(hospitalization_id, recorded_dttm, bilirubin_total)]
+
+#Merge bili and clean part one data table for time filtering
+bili_hosp_clean <- merge(part_one_data_clean, labs_bili, by = "hospitalization_id", all.x =TRUE)
+
+#TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+bili_hosp_clean[, start_time := as.POSIXct(begin_imv) - hours(24), by = hospitalization_id]
+
+# Calculate end_time based on the condition for each hospitalization_id
+bili_hosp_clean[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+bili_hosp_filt <- bili_hosp_clean[recorded_dttm >= start_time & recorded_dttm <= end_time]
+bili_hosp_filt <- bili_hosp_filt[, .(hospitalization_id, recorded_dttm, bilirubin_total)]
+
+
+# STEP 5: Platelets Table
+#Platelet Lab Values
+labs_platelets <- labs[lab_category %in% c("platelet_count")]
+labs_platelets <- labs_platelets[, .(hospitalization_id, recorded_dttm, lab_category, lab_value_numeric)]
+setorder(labs_platelets, hospitalization_id, recorded_dttm)
+
+# Reshape the data to spread plts into a column, using 'mean' to handle duplicates
+labs_platelets <- dcast(labs_platelets, 
+                   hospitalization_id + recorded_dttm ~ lab_category, 
+                   value.var = "lab_value_numeric", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+labs_platelets <- labs_platelets[, .(hospitalization_id, recorded_dttm, platelet_count)]
+
+#Merge plts and clean data from part one for time filtering
+platelets_hosp_clean <- merge(part_one_data_clean, labs_platelets, by = "hospitalization_id", all.x =TRUE)
+
+#TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+platelets_hosp_clean[, start_time := as.POSIXct(begin_imv) - hours(24), by = hospitalization_id]
+
+# Calculate end_time based on the condition for each hospitalization_id
+platelets_hosp_clean[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+platelets_hosp_filt <- platelets_hosp_clean[recorded_dttm >= start_time & recorded_dttm <= end_time]
+platelets_hosp_filt <- platelets_hosp_filt[, .(hospitalization_id, recorded_dttm, platelet_count)]
+
+
+# STEP 6: GCS Table
+# Identify GCS_Total Values
+pat_assess_gcs <- patient_assessments[assessment_category == "gcs_total"][hospitalization_id %in% hosp_id_vitals_clean]
+setorder(pat_assess_gcs, hospitalization_id, recorded_dttm)
+
+# Reshape the data to spread GCS into a column, using 'mean' to handle duplicates
+pat_assess_gcs <- dcast(pat_assess_gcs, 
+                   hospitalization_id + recorded_dttm ~ assessment_category, 
+                   value.var = "numerical_value", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+pat_assess_gcs <- pat_assess_gcs[, .(hospitalization_id, recorded_dttm, gcs_total)]
+
+# Merge GCS data with clean data from part one for time filtering
+gcs_hosp_clean <- merge(part_one_data_clean, pat_assess_gcs, by = "hospitalization_id", all.x = TRUE)
+
+#TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+gcs_hosp_clean[, start_time := as.POSIXct(begin_imv) - hours(24), by = hospitalization_id]
+
+# Calculate end_time based on the condition for each hospitalization_id
+gcs_hosp_clean[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+gcs_hosp_filt <- gcs_hosp_clean[recorded_dttm >= start_time & recorded_dttm <= end_time]
+gcs_hosp_filt <- gcs_hosp_filt[, .(hospitalization_id, recorded_dttm, gcs_total)]
+
+
+# STEP 7: SOFA Meds
+# Filter only for vasopressor sofa meds
+meds_sofa <- meds[med_category %in% c("dopamine", "dobutamine", "epinephrine", "norepineprhine")]
+meds_sofa <- meds_sofa[, .(hospitalization_id, admin_dttm, med_category, med_dose, med_dose_unit)]
+setnames(meds_sofa, "admin_dttm", "recorded_dttm")
+setorder(meds_sofa, hospitalization_id, recorded_dttm)
+
+# Merge with Weight Data
+meds_sofa_weight <- merge(meds_sofa, admission_bmi, by = "hospitalization_id", all.x = TRUE)
+meds_sofa_weight <- meds_sofa_weight[, .(hospitalization_id, recorded_dttm, med_category, med_dose, med_dose_unit, admission_weight)]
+
+meds_sofa_weight[, med_dose_weight := fifelse(
+  med_dose_unit %in% c("mcg/kg/min", "MCG/KG/MIN", "Mcg/Kg/Min"), 
+  med_dose, 
+  med_dose / admission_weight
+)]
+meds_sofa_weight_clean <- meds_sofa_weight[, .(hospitalization_id, recorded_dttm, med_category, med_dose_weight)]
+
+# Merge SOFA Meds with cleaned part one data for time filtering
+meds_sofa_hosp_clean <- merge(part_one_data_clean, meds_sofa_weight_clean, by = "hospitalization_id", all.x = TRUE)
+
+#TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+meds_sofa_hosp_clean[, start_time := as.POSIXct(begin_imv) - hours(24), by = hospitalization_id]
+
+# Calculate end_time based on the condition for each hospitalization_id
+meds_sofa_hosp_clean[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+meds_sofa_hosp_filt <- meds_sofa_hosp_clean[recorded_dttm >= start_time & recorded_dttm <= end_time]
+meds_sofa_hosp_filt <- meds_sofa_hosp_filt[, .(hospitalization_id, recorded_dttm, med_category, med_dose_weight)]
+
+
+# ******
+# STEP 8: MERGER of data tables to form final SOFA Table
+# *****
+
+# First Merge Timeline with P/F
+sofa_table_one <- merge(hosp_clean_timeline, pao2_fio2_sofa, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+# Second Merge with Platelets
+sofa_table_two <- merge(sofa_table_one, platelets_hosp_filt, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+# Third Merge with GCS
+sofa_table_three <- merge(sofa_table_two, gcs_hosp_filt, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+# Fourth Merge with Bilirubin
+sofa_table_four <- merge(sofa_table_three, bili_hosp_filt, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+# Fifth Merge with Creatinine
+sofa_table_five <- merge(sofa_table_four, cr_hosp_filt, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+# Sixth Merge with MAP
+sofa_table_six <- merge(sofa_table_five, map_table_final, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+# Final Merge with SOFA Meds
+sofa_table_final <- merge(sofa_table_six, meds_sofa_hosp_filt, 
+                         by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+# Fill in Blanks and Use LOCF to Fill Out the Table
+cols_to_update <- c("p_to_f", "platelet_count", "gcs_total", "bilirubin_total", "creatinine", "map", "med_category", "med_dose_weight")
+sofa_table_final[, (cols_to_update) := lapply(.SD, function(x) fifelse(x == "", NA, x)), .SDcols = cols_to_update]
+
+sofa_table <- sofa_table_final[, (cols_to_update) := lapply(.SD, function(x) na.locf(x, na.rm = FALSE)), 
+                 by = hospitalization_id, .SDcols = cols_to_update]
+
+
+# STEP 9: SOFA SCORE ASSEMBLY
+
+# Pulm SOFA
+sofa_table[, pulm_sofa := fcase(
+  p_to_f >= 400, 0,
+  p_to_f >= 300 & p_to_f < 400, 1,
+  p_to_f >= 200 & p_to_f < 300, 2,
+  p_to_f >= 100 & p_to_f < 200, 3,
+  p_to_f < 100, 4,
+  is.na(p_to_f), 0  # Assign 0 if p_to_f is NA
+)]
+
+# Heme SOFA
+sofa_table[, heme_sofa := fcase(
+  platelet_count >= 150, 0,
+  platelet_count >= 100 & platelet_count < 150, 1,
+  platelet_count >= 50 & platelet_count < 100, 2,
+  platelet_count >= 20 & platelet_count < 50, 3,
+  platelet_count < 20, 4,
+  is.na(platelet_count), 0  # Assign 0 if platelet_count is NA
+)]
+
+# Neuro SOFA
+sofa_table[, neuro_sofa := fcase(
+  gcs_total == 15, 0,
+  gcs_total >= 13 & gcs_total < 15, 1,
+  gcs_total >= 10 & gcs_total < 13, 2,
+  gcs_total >= 6 & gcs_total < 10, 3,
+  gcs_total < 6, 4,
+  is.na(gcs_total), 0  # Assign 0 if gcs_total is NA
+)]
+
+# GI SOFA
+sofa_table[, gi_sofa := fcase(
+  bilirubin_total < 1.2, 0,
+  bilirubin_total >= 1.2 & bilirubin_total < 2.0, 1,
+  bilirubin_total >= 2.0 & bilirubin_total < 6.0, 2,
+  bilirubin_total >= 6.0 & bilirubin_total < 12.0, 3,
+  bilirubin_total >= 12, 4,
+  is.na(bilirubin_total), 0  # Assign 0 if bilirubin_total is NA
+)]
+
+# Renal SOFA
+sofa_table[, renal_sofa := fcase(
+  creatinine < 1.2, 0,
+  creatinine >= 1.2 & creatinine < 2.0, 1,
+  creatinine >= 2.0 & creatinine < 3.5, 2,
+  creatinine >= 3.5 & creatinine < 5.0, 3,
+  creatinine >= 5.0, 4,
+  is.na(creatinine), 0  # Assign 0 if creatinine is NA
+)]
+
+# Card SOFA
+sofa_table[, card_sofa := fcase(
+  map > 70 & is.na(med_category), 0,
+  map < 70 & is.na(med_category), 1,
+  med_category == "dopamine" & med_dose_weight <= 5, 2,
+  med_category == "dobutamine", 2,
+  med_category == "dopamine" & med_dose_weight > 5, 3,
+  med_category == "epinephrine" & med_dose_weight <= 0.1, 3,
+  med_category == "norepinephrine" & med_dose_weight <= 0.1, 3,
+  med_category == "dopamine" & med_dose_weight >= 15, 4,
+  med_category == "epinephrine" & med_dose_weight > 0.1, 4,
+  med_category == "norepinephrine" & med_dose_weight > 0.1, 4,
+  is.na(map) | is.na(med_category) | is.na(med_dose_weight), 0  # Assign 0 if any relevant value is NA
+)]
+
+
+# STEP 10: List of SOFA score columns for which to calculate maximum value
+sofa_cols <- c("pulm_sofa", "heme_sofa", "neuro_sofa", "gi_sofa", "renal_sofa", "card_sofa")
+
+
+# STEP 11: Create a new table with the maximum SOFA scores per hospitalization_id
+max_sofa_table <- sofa_table[, lapply(.SD, max, na.rm = TRUE), by = hospitalization_id, .SDcols = sofa_cols]
+
+
+# STEP 12: Calculate total SOFA score
+max_sofa_table[, total_sofa := pulm_sofa + heme_sofa + neuro_sofa + gi_sofa + renal_sofa + card_sofa]
+sofa_final <- max_sofa_table[, .(hospitalization_id, total_sofa)] 
+```
+
+
+
+# PART TEN: Time to SBT
+# NEED TO CLEAN THIS UP FOR FINALIZATION
+```{R}
+# Ensure 'sbt_delivery' is a column with 'Yes'/'No' values
+pat_assess_sbt <- patient_assessments[assessment_category == "sbt_delivery" &
+                                      hospitalization_id %in% hosp_id_vitals_clean]
+setorder(pat_assess_sbt, hospitalization_id, recorded_dttm)
+
+# Use dcast to pivot the data without aggregation, filling any missing values with NA
+pat_assess_sbt <- dcast(pat_assess_sbt, 
+                        hospitalization_id + recorded_dttm ~ assessment_category, 
+                        value.var = "categorical_value", 
+                        fill = NA)
+
+# Merge with hospitalization characteristics to include begin_imv and end_imv timestamps
+hosp_characteristics <- part_one_data_clean[hospitalization_id %in% hosp_id_vitals_clean, .(hospitalization_id, begin_imv, end_imv, total_imv_time)]
+sbt_hosp_merge <- merge(hosp_characteristics, pat_assess_sbt, by = "hospitalization_id", all = TRUE)
+
+# Filter for sbt_delivery == "Yes" and recorded_dttm between begin_imv and end_imv, then calculate the earliest recorded_dttm
+first_sbt <- sbt_hosp_merge[sbt_delivery == "Yes" & recorded_dttm > begin_imv & recorded_dttm <= end_imv, 
+                            .(first_sbt = min(recorded_dttm)),  # Get the earliest recorded_dttm
+                            by = hospitalization_id]
+
+# Merge again
+first_sbt_hosp <- merge(hosp_characteristics, first_sbt, by = "hospitalization_id", all = TRUE)
+
+# Fill in missing values in first_sbt with end_imv
+first_sbt_hosp[is.na(first_sbt) & total_imv_time < 48, first_sbt := end_imv]
+
+# Calculate the time difference in hours between begin_imv and first_sbt
+first_sbt_hosp[, time_to_first_sbt := as.numeric(difftime(first_sbt, begin_imv, units = "hours"))]
+
+first_sbt_calc <- first_sbt_hosp[, .(hospitalization_id, time_to_first_sbt)]
+
+
+```
+
+
+# PART ELEVEN: Determine primary sedation medication used
+
+```{r}
+
+# STEP 1: Filter only for sedative meds
+meds_sedation <- meds[med_category %in% c("propofol", "dexmedetomidine", "ketamine", "midazolam", "pentobarbital", "lorazepam")]
+
+
+# STEP 2: Filter only for doses >0
+meds_sedation_filtered <- meds_sedation[med_dose > 0]
+
+
+# STEP 3: Merge with clean part one data for time filtering
+meds_sedation_clean <- merge(part_one_data_clean, meds_sedation_filtered, by = "hospitalization_id", all.x = TRUE)
+
+
+#STEP 4: TIME FILTERING
+# Calculate start_time (24 hours before begin_imv)
+meds_sedation_clean[, start_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Calculate end_time based on the condition for each hospitalization_id
+meds_sedation_clean[, end_time := as.POSIXct(begin_imv) + hours(48), by = hospitalization_id]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+meds_sedation_final <- meds_sedation_clean[admin_dttm >= start_time & admin_dttm <= end_time]
+meds_sedation_final <- meds_sedation_final[, .(hospitalization_id, admin_dttm, med_category, med_dose, med_dose_unit)]
+setnames(meds_sedation_final, "admin_dttm", "recorded_dttm")
+setorder(meds_sedation_final, hospitalization_id, med_category, recorded_dttm)
+
+# Set Up Timeline
+timeline_48hrimv <- part_one_data_clean[, .(recorded_dttm = seq(
+                                          from = as.POSIXct(min(begin_imv)) - hours(0), 
+                                          to = as.POSIXct(min(begin_imv) + hours(48)),
+                                          by = "15 min")), 
+                                  by = .(hospitalization_id)]
+
+# Merge Meds Sedation Final and Timeline
+meds_sedation_timeline <- merge(timeline_48hrimv, meds_sedation_final, by = c("hospitalization_id", "recorded_dttm"), 
+                         all = TRUE)
+
+
+# Fill in Blanks and Use LOCF to Fill Out the Table
+cols_to_update_meds <- c("med_category", "med_dose", "med_dose_unit")
+meds_sedation_timeline[, (cols_to_update_meds) := lapply(.SD, function(x) fifelse(x == "", NA, x)), .SDcols = cols_to_update_meds]
+
+
+meds_sedation_timeline_final <- meds_sedation_timeline[, (cols_to_update_meds) := lapply(.SD, function(x) na.locf(x, na.rm = FALSE)), 
+                 by = hospitalization_id, .SDcols = cols_to_update_meds]
+
+# Step 2: Identify consecutive runs of the same med_category within each hospitalization_id
+meds_sedation_timeline_final[, `:=`(
+  run_id = rleid(med_category),  # Run ID for each consecutive block of the same med_category
+  next_recorded_dttm = shift(recorded_dttm, type = "lead")  # Next recorded time
+), by = hospitalization_id]
+
+# Step 3: Calculate duration of each run by finding the difference between the last and first recorded_dttm in each run
+meds_sedation_timeline_final[, duration := as.numeric(difftime(
+  max(recorded_dttm), min(recorded_dttm), units = "hours")
+), by = .(hospitalization_id, run_id, med_category)]
+
+# Step 4: Remove duplicates to keep only one row per unique run
+meds_runs <- unique(meds_sedation_timeline_final, by = c("hospitalization_id", "run_id", "med_category"))
+
+# Step 5: Sum total time per medication within each hospitalization_id
+med_duration_total <- meds_runs[, .(total_hours = sum(duration)), by = .(hospitalization_id, med_category)]
+
+# Step 6: Identify the medication with the longest total duration as primary_sedative
+med_primary <- med_duration_total[, .SD[which.max(total_hours)], by = hospitalization_id]
+
+# Rename and clean up columns
+setnames(med_primary, "med_category", "primary_sedative")
+
+sedative_table <- med_primary[, .(hospitalization_id, primary_sedative)]
+
+
+```
+
+# PART ELEVEN: Assemble Final Analytic Table
+# ***Merge all tables
+```{R}
+# First Merge Demographics and RASS Percent
+analytic_table_one <- merge(demographics, rass_percentages, by = "hospitalization_id", all.x = TRUE)
+setnames(analytic_table_one, 
+         old = c("race_category", "ethnicity_category", "sex_category", "language_category", "age_at_admission"), 
+         new = c("race", "ethnicity", "sex", "language", "age"))
+
+# Second Merge with BMI
+analytic_table_two <- merge(analytic_table_one, admission_bmi_final, by = "hospitalization_id", all.x = TRUE)
+
+# Third merge with Paralysis
+analytic_table_three <- merge(analytic_table_two, paralytic_final, by = "hospitalization_id", all.x = TRUE)
+
+# Fourth Merge with SOFA
+analytic_table_four <- merge(analytic_table_three, sofa_final, by = "hospitalization_id", all.x = TRUE)
+
+# Fifth Merge with Hospital ID
+analytic_table_five <- merge(analytic_table_four, hospital_id_final, by = "hospitalization_id", all.x = TRUE)
+
+# Sixth Merge with Time to SBT
+analytic_table_six <- merge(analytic_table_five, first_sbt_calc, by = "hospitalization_id", all.x =TRUE)
+
+# Seventh Merge with Clean Table One Data
+analytic_table_seven <- merge(analytic_table_six, part_one_data_clean, by = "hospitalization_id", all.x =TRUE)
+
+
+# Eighth Merge with Sedative Table
+analytic_table_eight <- merge(analytic_table_seven, sedative_table, by = "hospitalization_id", all.x =TRUE)
+
+
+#Save to file
+fwrite(analytic_table_eight, file = paste0(output_dir, "analytic_table.csv.gz"))
+```
+
