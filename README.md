@@ -24,7 +24,7 @@ Please refer to the online CLIF data dictionary, ETL tools, and specific table c
     - `vital_catgories %in% c("sbp", "dbp", "height_cm", weight_kg")`
 * `labs`
     - `hospitalization_id`, `lab_collect_dttm`, `lab_value_numeric`
-    - `lab_category %in% c("creatinine", "total_bilirubin", "platelet_count", "po2_arterial")`
+    - `lab_category %in% c("creatinine", "bilirubin_total", "platelet_count", "po2_arterial")`
 * `continuous_med_admin`
     - `hospitalization_id`, `admin_dttm`, `med_dose`, `med_dose_unit`
     - `med_category %in% c("dopamine", "dobutamine", "epinephrine", "norepineprhine", "propofol", "dexmedetomidine", "ketamine", "midazolam", "pentobarbital", "lorazepam")`
