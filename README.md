@@ -9,12 +9,13 @@ Please refer to the online CLIF data dictionary, ETL tools, and specific table c
 
 ### To identify hospitalizations with periods of mechanical ventilation
 * `respiratory_support`
-    - `hospitalization_id`, `recorded_dttm`, `device_category = "IMV"`, `device_category = "Trach Collar"`, `tracheostomy`
+    - `hospitalization_id`, `recorded_dttm`, `tracheostomy`
+    - `device_category %in% c("IMV", "Trach Collar")`
 * `hospitalization`
      - `patient_id`, `hospitalization_id`, `admission_dttm`, `discharge_dttm`, `age_at_admission`, `discharge_category`
 * `patient`
 
-### To build sedation table and control variables (BMI, SOFA, sex, race, ethnicity, 30-day mortality, sedative meds)
+### To build sedation table, secondary analysis endpoints, and control variables (BMI, SOFA, sex, race, ethnicity, 30-day mortality, sedative meds)
 * `patient_assessments`
     - `hospitalization_id`, `recorded_dttm`, `assessment_category = "RASS"`, `assessment_category = "gcs_total"`, `numerical_value`
 * `vitals`
