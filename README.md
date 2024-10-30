@@ -17,7 +17,8 @@ Please refer to the online CLIF data dictionary, ETL tools, and specific table c
 
 ### To build sedation table, secondary analysis endpoints, and control variables (BMI, SOFA, sex, race, ethnicity, 30-day mortality, sedative meds)
 * `patient_assessments`
-    - `hospitalization_id`, `recorded_dttm`, `assessment_category = "RASS"`, `assessment_category = "gcs_total"`, `numerical_value`
+    - `hospitalization_id`, `recorded_dttm`, `numerical_value`
+    - `assessment_category %in% c("RASS", "gcs_total")`
 * `vitals`
     - `hospitalization_id`, `recorded_dttm`, `vital_value`
     - `vital_catgories %in% c("sbp", "dbp", "height_cm", weight_kg")`
