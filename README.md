@@ -42,10 +42,15 @@ Please refer to the online CLIF data dictionary, ETL tools, and specific table c
 Adults with documented IMV periods >24 hours. There are no date constraints.
 
 ## Expected Results
-under construction
+* Cohort Language Summary (html file)
+* CSV file for primary analysis results
+* CSV file for secondary analysis results x2 (imv time and mortality)
+* Sub-Group Cohort Language Summaries (x4)
+* CSV file for sub-group analysis results
 
 ## Detailed Instructions
-1. Run [CODE](https://github.com/weissman-lab/preferred_language_icu/tree/main/CODE)
-2. Deposit results:
+1. Update yaml file in repo with base directory, file type, and institution information
+2. Run [CODE](https://github.com/weissman-lab/preferred_language_icu/tree/main/CODE)
+3. Deposit results:
 
 Please deposit your entire result_[SITE_NAME] folder in this [box folder](https://uchicago.box.com/s/fcaum7o8v59n9c1vy7xnboqy2in4t4ju)
