@@ -3,14 +3,14 @@
 ```{r}
 # Install Packages
 
-packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr")
+packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr", "fst", "arrow", "table1", "lme4", "metafor", "yaml")
 install_if_missing <- function(package) {
   if (!require(package, character.only = TRUE)) {
     install.packages(package, dependencies = TRUE)
     library(package, character.only = TRUE)
   }
 }
- 
+
 sapply(packages, install_if_missing)
 
 # Load necessary libraries
@@ -19,34 +19,52 @@ library(dplyr)
 library(zoo)  # for na.locf function
 library(lubridate)
 library(tidyr)
+library(fst)
+library(arrow)
+library(table1)
+library(metafor)
+library(yaml)
+
+config <- yaml::read_yaml("config.yaml")
+
+# Define directories based on YAML configuration
+data_dir <- config$data_dir
+output_dir <- file.path(data_dir, "sedation_language_project/intermediate_data/")  # Define output_dir based on data_dir
+file_type <- config$file_type
+institution <- config$institution
+
+# Create the output directory if it does not exist
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)  # 'recursive = TRUE' allows creating nested directories
+}
 
 ```
 
 # PART ONE:
-# ***Define the data directory for the rest of the script
 # ***Upload Raw Respiratory, Hospitalization, and Patient Tables
 # ***Initial identification and cleaning of IMV patients and tracheostomy patients
 
 ```{r}
-# Define the Directory Where Existing CLIF Tables are Located
-data_dir <- "/share/projects/data/circe/v20240931a/clif/" # Add your directory information here
-
-# Define the Directory where Intermediate and Final Tables will be saved
-output_dir <- "/share/projects/data/circe/v20240931a/clif/sedation_project/" # Add your output information here
-
-# Add your File Type here:
-
-
-# Add your institution here
-Institution <- "Penn"
-
+read_data <- function(file_path, select = NULL) {
+  if (grepl("\\.csv$|\\.csv\\.gz$", file_path)) {
+    # Use fread with the select argument for CSV and CSV.GZ files
+    return(fread(file_path, select = select))
+  } else if (grepl("\\.parquet$", file_path)) {
+    # Use read_parquet with col_select for Parquet files
+    return(arrow::read_parquet(file_path, col_select = select))
+  } else if (grepl("\\.fst$", file_path)) {
+    # Use read_fst with columns for FST files
+    return(fst::read_fst(file_path, columns = select))
+  } else {
+    stop("Unsupported file format. Only CSV, Parquet, and FST are supported.")
+  }
+}
 
 # STEP 1: Load Raw CLIF Respiratory Support, Hospitalization, and Patient Tables
-respiratory_support <- fread(paste0(data_dir, "respiratory_support.csv.gz"), select = c("hospitalization_id", "recorded_dttm", "device_category", "tracheostomy"))
-hospitalization <- fread(paste0(data_dir, "hospitalization.csv.gz"), select = c("patient_id", "hospitalization_id", "admission_dttm", "discharge_dttm", "age_at_admission", "discharge_category"))
+respiratory_support <- as.data.table(read_data(paste0(data_dir, "clif_respiratory_support", file_type), select = c("hospitalization_id", "recorded_dttm", "device_category", "tracheostomy")))
+hospitalization <- as.data.table(read_data(paste0(data_dir, "clif_hospitalization", file_type), select = c("patient_id", "hospitalization_id", "admission_dttm", "discharge_dttm", "age_at_admission", "discharge_category")))
 hospitalization <- unique(hospitalization, by = "hospitalization_id")
-patient <- fread(paste0(data_dir,"patient.csv.gz"))
-
+patient <- as.data.table(read_data(paste0(data_dir,"clif_patient", file_type), select = c("patient_id", "death_dttm")))
 
 # STEP 2: Identifying the tracheostomy patients
 # Identify hospitalization_ids that have tracheostomy at some point during their hospitalization and earliest timestamp for this finding

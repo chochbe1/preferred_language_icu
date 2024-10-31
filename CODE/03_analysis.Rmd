@@ -1,17 +1,14 @@
 
 # Setup Step: Setup libraries
 ```{r}
-
-# Install Packages
-
-packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr")
+packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr", "fst", "arrow", "table1", "lme4", "metafor", "yaml", "htmltools")
 install_if_missing <- function(package) {
   if (!require(package, character.only = TRUE)) {
     install.packages(package, dependencies = TRUE)
     library(package, character.only = TRUE)
   }
 }
- 
+
 sapply(packages, install_if_missing)
 
 # Load necessary libraries
@@ -20,132 +17,256 @@ library(dplyr)
 library(zoo)  # for na.locf function
 library(lubridate)
 library(tidyr)
+library(fst)
+library(arrow)
+library(table1)
+library(metafor)
+library(yaml)
+library(htmltools)
 
+config <- yaml::read_yaml("config.yaml")
+
+# Define directories based on YAML configuration
+data_dir <- config$data_dir
+intermediate_dir <- file.path(data_dir, "sedation_language_project/intermediate_data/")  # Define output_dir based on data_dir
+output_dir <- file.path(data_dir, "sedation_language_project/final_data/")
+file_type <- config$file_type
+institution <- config$institution
+
+
+# Create the output directory if it does not exist
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)  # 'recursive = TRUE' allows creating nested directories
+}
 ```
 
+# PART ONE: Summary Statistics
 ```{r}
-
-# Define the Directory Where Existing CLIF Tables are Located
-data_dir <- "/share/projects/data/circe/v20240931a/clif/" # Add your directory information here
-
-# Define the Directory where Intermediate and Final Tables will be saved
-output_dir <- "/share/projects/data/circe/v20240931a/clif/sedation_project/" # Add your output information here
-
-# Add your File Type here:
-
-
-# Add your institution here
-Institution <- "Penn" # Add your institution here
-
 # Upload Part One Data Table
-part_two_data <- fread(paste0(output_dir, "analytic_table.csv.gz"))
+part_two_data <- fread(paste0(intermediate_dir, "analytic_table.csv.gz"))
 
 
 # Identify reference points for model
+part_two_data$language <- relevel(as.factor(part_two_data$language), ref = "English")
 part_two_data$ethnicity <- relevel(as.factor(part_two_data$ethnicity), ref = "Non-Hispanic")
 part_two_data$race <- relevel(as.factor(part_two_data$race), ref = "White")
 part_two_data$sex <- relevel(as.factor(part_two_data$sex), ref = "Male")
-part_two_data$hospital_ids <- relevel(as.factor(part_two_data$hospital_ids), ref = "HUP")
 part_two_data$primary_sedative <- relevel(as.factor(part_two_data$primary_sedative), ref = "propofol")
 
+# Create labels for readability
+label(part_two_data$race) <- "Race"
+label(part_two_data$ethnicity) <- "Ethnicity"
+label(part_two_data$sex) <- "Sex"
+label(part_two_data$age) <- "Age"
+label(part_two_data$language) <- "Language"
+label(part_two_data$bmi) <- "BMI"
+label(part_two_data$paralyzed) <- "Paralyzed"
+label(part_two_data$total_sofa) <- "Average SOFA"
+label(part_two_data$hospital_id) <- "Hospital"
+label(part_two_data$primary_sedative) <- "Primary Sedative"
 
-# Intersection group
-part_two_data$intersection_group <- interaction(part_two_data$race, part_two_data$ethnicity, drop = TRUE)
-part_two_data$intersection_group<- relevel(as.factor(part_two_data$intersection_group), ref = "White.Non-Hispanic")
+# Generate the summary table by grouping variable
+table1(~ age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_id + primary_sedative | language, data = part_two_data)
 
+# Generate the summary table grouped by language
+summary_table <- table1(~ age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_id + primary_sedative | language, data = part_two_data)
 
+# Convert to HTML and save as file
+save_html(as.tags(summary_table), file = paste0(output_dir, institution, "_total_cohort_language_summary.html"))
 
-# Fit the model
-model <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_ids + primary_sedative + intersection_group, data = part_two_data)
+```
 
-summary(model)
+# PART TWO: Primary Analysis
+```{r}
 
+# Fit the unadjusted primary model
+primary_model_unadjusted <- lm(percent_deep_sedation ~ language, data = part_two_data)
 
+# Extract coefficients, standard errors, variance, and p-values for the unadjusted model
+primary_results_unadjusted <- data.frame(
+  term = names(coef(primary_model_unadjusted)),
+  estimate = coef(primary_model_unadjusted),
+  std.error = summary(primary_model_unadjusted)$coefficients[, "Std. Error"],
+  variance = (summary(primary_model_unadjusted)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(primary_model_unadjusted)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
 
+# Fit the adjusted primary model
+primary_model_adjusted <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + factor(hospital_id) + factor(primary_sedative), data = part_two_data)
 
-# Fit the model
-model_two <- lm(time_to_first_sbt ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_ids + primary_sedative, data = part_two_data)
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+primary_results_adjusted <- data.frame(
+  term = names(coef(primary_model_adjusted)),
+  estimate = coef(primary_model_adjusted),
+  std.error = summary(primary_model_adjusted)$coefficients[, "Std. Error"],
+  variance = (summary(primary_model_adjusted)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(primary_model_adjusted)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
 
-summary(model_two)
+# Combine the results into one data frame
+primary_results_combined <- bind_rows(
+  primary_results_unadjusted %>% mutate(model = "Unadjusted"),
+  primary_results_adjusted %>% mutate(model = "Adjusted")
+)
 
-
-
-
-# Model Four
-
-model_four <- lm(total_imv_time ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_ids + primary_sedative, data = part_two_data)
-summary(model_four)
-
-
-
-# Model of Primary Sedative
-library(nnet)
-
-# Fit the multinomial logistic regression model
-model_five <- multinom(primary_sedative ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_ids, 
-                  data = part_two_data)
-
-# Summary of the model
-summary(model_five)
-
+# Save the combined results to a file
+fwrite(primary_results_combined, file = paste0(output_dir, institution, "_primary_analysis_results.csv.gz"))
 
 ```
 
 
+# PART THREE: Secondary Analysis
 ```{r}
 
+# Secondary Model of Total IMV Time
+secondary_model_imv_time <- lm(total_imv_time ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + factor(hospital_id), data = part_two_data)
 
-# Risk of Prolonged Mechanical Ventilation
-
-# Load the survival package
-library(survival)
-
-# Create a binary variable for prolonged mechanical ventilation
-part_two_data[, prolonged_mv := ifelse(total_imv_time > 504, 1, 0)]
-
-# Fit the Cox proportional hazards model
-cox_model <- coxph(Surv(total_imv_time, prolonged_mv) ~ language + age + sex + race + ethnicity + primary_sedative + bmi + paralyzed + total_sofa + hospital_ids + intersection_group, data = part_two_data)
-
-# Summarize the model to view the hazard ratios
-summary(cox_model)
+summary(secondary_model_imv_time)
 
 
-# Calculate time to trach
+# Extract coefficients and statistics for total imv time model
+secondary_results_imv_time <- data.frame(
+  term = names(coef(secondary_model_imv_time)),
+  estimate = coef(secondary_model_imv_time),
+  std.error = summary(secondary_model_imv_time)$coefficients[, "Std. Error"],
+  variance = (summary(secondary_model_imv_time)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(secondary_model_imv_time)$coefficients[, "Pr(>|t|)"]  # Extract p-values from the correct model
+)
 
 
+
+# Save to file
+fwrite(secondary_results_imv_time, file = paste0(output_dir, institution, "_secondary_analysis_results_imv_time.csv.gz"))
+
+
+# Secondary Model of 30-Day Mortality
+secondary_model_mortality <- glm(thirty_day_mortality ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + factor(hospital_id), 
+                                  data = part_two_data, 
+                                  family = binomial(link = "logit"))
+summary(secondary_model_mortality)
+
+# Extract coefficients and calculate odds ratios, standard errors, and variance
+coef_summary <- summary(secondary_model_mortality)$coefficients
+odds_ratios <- exp(coef_summary[, "Estimate"])  # Exponentiated coefficients
+standard_errors <- coef_summary[, "Std. Error"]
+variance <- standard_errors^2  # Calculate variance
+p_values <- coef_summary[, "Pr(>|z|)"]  # Extract p-values
+
+# Create a data frame to hold the results
+secondary_results_df <- data.frame(
+    Variable = rownames(coef_summary),
+    Odds_Ratio = odds_ratios,
+    Std_Error = standard_errors,
+    Variance = variance,  # Add variance
+    P_Value = p_values    # Add p-values
+)
+
+# Write the results to a CSV file
+fwrite(secondary_results_df, file = paste0(output_dir, institution, "_secondary_analysis_results_mortality.csv.gz"))
 
 ```
 
 
+# PART FOUR: Sub-Group Analysis
 ```{r}
 
+extract_model_results <- function(model, model_name) {
+  coef_summary <- summary(model)$coefficients
+  results_df <- data.frame(
+    term = rownames(coef_summary),
+    estimate = coef(model),
+    std.error = coef_summary[, "Std. Error"],
+    variance = (coef_summary[, "Std. Error"])^2,  # Calculate variance
+    p.value = coef_summary[, "Pr(>|t|)"]  # Extract p-values for linear models
+  )
+  results_df$model <- model_name
+  return(results_df)
+}
 
-# Subset data to only include Hispanic patients
+# STEP ONE:
+# HISPANIC/LATINO ANALYSIS
 hispanic_data <- part_two_data[ethnicity == "Hispanic"]
+hispanic_data$language <- relevel(as.factor(hispanic_data$language), ref = "English")
 hispanic_data$race <- relevel(as.factor(hispanic_data$race), ref = "White")
 hispanic_data$sex <- relevel(as.factor(hispanic_data$sex), ref = "Male")
-hispanic_data$hospital_ids <- relevel(as.factor(hispanic_data$hospital_ids), ref = "HUP")
 hispanic_data$primary_sedative <- relevel(as.factor(hispanic_data$primary_sedative), ref = "propofol")
 
+# Generate the summary table grouped by language
+summary_table_hispanic <- table1(~ age + sex + race + bmi + paralyzed + total_sofa + hospital_id + primary_sedative | language, data = hispanic_data)
+
+# Convert to HTML and save as file
+save_html(as.tags(summary_table_hispanic), file = paste0(output_dir, institution, "_hispanic_cohort_language_summary.html"))
+
 # Fit a linear model for Hispanic patients, excluding ethnicity
-model_hispanic <- lm(percent_deep_sedation ~ language + age + sex + race + bmi + paralyzed + total_sofa + hospital_ids + primary_sedative, data = hispanic_data)
-
-# Summarize the model
+model_hispanic <- lm(percent_deep_sedation ~ language + age + sex + race + bmi + paralyzed + total_sofa + factor(hospital_id) + factor(primary_sedative), data = hispanic_data)
 summary(model_hispanic)
+results_hispanic <- extract_model_results(model_hispanic, "Hispanic")
 
 
-```
+# STEP TWO:
+# BLACK/AFRICAN AMERICAN ANALYSIS
+black_data <- part_two_data[race == "Black or African American"]
+black_data$language <- relevel(as.factor(black_data$language), ref = "English")
+black_data$ethnicity <- relevel(as.factor(black_data$ethnicity), ref = "Non-Hispanic")
+black_data$sex <- relevel(as.factor(black_data$sex), ref = "Male")
+black_data$primary_sedative <- relevel(as.factor(black_data$primary_sedative), ref = "propofol")
+
+# Generate the summary table grouped by language
+summary_table_aa <- table1(~ age + sex + ethnicity + bmi + paralyzed + total_sofa + hospital_id + primary_sedative | language, data = black_data)
+
+# Convert to HTML and save as file
+save_html(as.tags(summary_table_aa), file = paste0(output_dir, institution, "_aa_cohort_language_summary.html"))
+
+# Fit a linear model for Black patients, excluding race
+model_black <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + bmi + paralyzed + total_sofa + factor(hospital_id) + factor(primary_sedative), data = black_data)
+summary(model_black)
+results_black <- extract_model_results(model_black, "Black or African American")
 
 
-```{r}
+# STEP THREE:
+# ASIAN ANALYSIS
+asian_data <- part_two_data[race == "Asian"]
+asian_data$language <- relevel(as.factor(asian_data$language), ref = "English")
+asian_data$ethnicity <- relevel(as.factor(asian_data$ethnicity), ref = "Non-Hispanic")
+asian_data$sex <- relevel(as.factor(asian_data$sex), ref = "Male")
+asian_data$primary_sedative <- relevel(as.factor(asian_data$primary_sedative), ref = "propofol")
 
-part_two_data_filtered <- part_two_data[race != "Unknown" & ethnicity != "Unknown"]
+# Generate the summary table grouped by language
+summary_table_asian <- table1(~ age + sex + ethnicity + bmi + paralyzed + total_sofa + hospital_id + primary_sedative | language, data = asian_data)
+
+# Convert to HTML and save as file
+save_html(as.tags(summary_table_asian), file = paste0(output_dir, institution, "_asian_cohort_language_summary.html"))
+
+# Fit a linear model for Asian patients
+model_asian <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + bmi + paralyzed + total_sofa + factor(hospital_id) + factor(primary_sedative), data = asian_data)
+summary(model_asian)
+results_asian <- extract_model_results(model_asian, "Asian")
 
 
-# Fit the model
-model_filtered <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_ids + primary_sedative, data = part_two_data_filtered)
+# STEP FOUR:
+# WHITE ANALYSIS
+white_data <- part_two_data[race == "White"]
+white_data$language <- relevel(as.factor(white_data$language), ref = "English")
+white_data$ethnicity <- relevel(as.factor(white_data$ethnicity), ref = "Non-Hispanic")
+white_data$sex <- relevel(as.factor(white_data$sex), ref = "Male")
+white_data$primary_sedative <- relevel(as.factor(white_data$primary_sedative), ref = "propofol")
 
-summary(model_filtered)
+# Generate the summary table grouped by language
+summary_table_white <- table1(~ age + sex + ethnicity + bmi + paralyzed + total_sofa + hospital_id + primary_sedative | language, data = white_data)
 
+# Convert to HTML and save as file
+save_html(as.tags(summary_table_white), file = paste0(output_dir, institution, "_white_cohort_language_summary.html"))
+
+
+# Fit a linear model for White patients
+model_white <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + bmi + paralyzed + total_sofa + factor(hospital_id) + factor(primary_sedative), data = white_data)
+summary(model_white)
+results_white <- extract_model_results(model_white, "White")
+
+# Combine all results into one data frame
+combined_subgroup_results <- bind_rows(results_hispanic, results_black, results_asian, results_white)
+
+# Save to file
+fwrite(combined_subgroup_results, file = paste0(output_dir, institution, "_subgroup_analysis_results.csv.gz"))
 
 ```

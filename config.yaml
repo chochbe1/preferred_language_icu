@@ -1,0 +1,3 @@
+data_dir: "/share/projects/data/circe/v20240931a/clif/"
+file_type: ".csv.gz"
+institution: "Penn"
