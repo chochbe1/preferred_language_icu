@@ -65,9 +65,6 @@ label(part_two_data$total_sofa) <- "Average SOFA"
 label(part_two_data$hospital_id) <- "Hospital"
 label(part_two_data$primary_sedative) <- "Primary Sedative"
 
-# Generate the summary table by grouping variable
-table1(~ age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_id + primary_sedative | language, data = part_two_data)
-
 # Generate the summary table grouped by language
 summary_table <- table1(~ age + sex + ethnicity + race + bmi + paralyzed + total_sofa + hospital_id + primary_sedative | language, data = part_two_data)
 
@@ -91,8 +88,12 @@ primary_results_unadjusted <- data.frame(
   p.value = summary(primary_model_unadjusted)$coefficients[, "Pr(>|t|)"]  # Extract p-values
 )
 
+summary(primary_model_unadjusted)
+
 # Fit the adjusted primary model
 primary_model_adjusted <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + factor(hospital_id) + factor(primary_sedative), data = part_two_data)
+
+summary(primary_model_adjusted)
 
 # Extract coefficients, standard errors, variance, and p-values for the adjusted model
 primary_results_adjusted <- data.frame(

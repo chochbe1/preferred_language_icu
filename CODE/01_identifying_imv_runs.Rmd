@@ -48,13 +48,13 @@ if (!dir.exists(output_dir)) {
 read_data <- function(file_path, select = NULL) {
   if (grepl("\\.csv$|\\.csv\\.gz$", file_path)) {
     # Use fread with the select argument for CSV and CSV.GZ files
-    return(fread(file_path, select = select))
+    return(fread(file_path, select = all_of(select)))
   } else if (grepl("\\.parquet$", file_path)) {
     # Use read_parquet with col_select for Parquet files
-    return(arrow::read_parquet(file_path, col_select = select))
+    return(arrow::read_parquet(file_path, col_select = all_of(select)))
   } else if (grepl("\\.fst$", file_path)) {
     # Use read_fst with columns for FST files
-    return(fst::read_fst(file_path, columns = select))
+    return(fst::read_fst(file_path, columns = all_of(select)))
   } else {
     stop("Unsupported file format. Only CSV, Parquet, and FST are supported.")
   }

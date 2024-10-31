@@ -48,13 +48,13 @@ if (!dir.exists(output_dir)) {
 read_data <- function(file_path, select = NULL) {
   if (grepl("\\.csv$|\\.csv\\.gz$", file_path)) {
     # Use fread with the select argument for CSV and CSV.GZ files
-    return(fread(file_path, select = select))
+    return(fread(file_path, select = all_of(select)))
   } else if (grepl("\\.parquet$", file_path)) {
     # Use read_parquet with col_select for Parquet files
-    return(arrow::read_parquet(file_path, col_select = select))
+    return(arrow::read_parquet(file_path, col_select = all_of(select)))
   } else if (grepl("\\.fst$", file_path)) {
     # Use read_fst with columns for FST files
-    return(fst::read_fst(file_path, columns = select))
+    return(fst::read_fst(file_path, columns = all_of(select)))
   } else {
     stop("Unsupported file format. Only CSV, Parquet, and FST are supported.")
   }
@@ -64,7 +64,6 @@ read_data <- function(file_path, select = NULL) {
 part_one_data <- fread(paste0(output_dir, "imv_runs.csv.gz"))
 part_one_hosp_id <- unique(part_one_data$hospitalization_id)
 
-
 # STEP 1: Load Patient Assessments For Hospitalization_IDs above
 specific_assessment_categories <- c("RASS", "gcs_total")
 patient_assessments <- as.data.table(read_data(paste0(data_dir, "clif_patient_assessments", file_type), 
@@ -72,7 +71,7 @@ patient_assessments <- as.data.table(read_data(paste0(data_dir, "clif_patient_as
 
 
 # STEP 2: Upload CLIF Vitals 
-specific_vital_categories <- c("sbp", "dbp", "height_cm", "weight_kg")  # Replace with your actual categories
+specific_vital_categories <- c("sbp", "dbp", "height_cm", "weight_kg")
 vitals <- as.data.table(read_data(paste0(data_dir, "clif_vitals", file_type), 
   select = c("hospitalization_id", "recorded_dttm", "vital_category", "vital_value"))
 )[hospitalization_id %in% part_one_hosp_id & vital_category %in% specific_vital_categories]
@@ -116,7 +115,6 @@ respiratory_support <- as.data.table(read_data(paste0(data_dir, "clif_respirator
 # ***Identify earliest RASS timepoint
 # ***Flag hospitalizations with missing RASS values between 2 hours before and 8 hours after IMV
 ```{r}
-
 # STEP 1: Form RASS Specific Patient Assessment Table
 pat_assess_rass <- patient_assessments[assessment_category == "RASS"]
 setorder(pat_assess_rass, hospitalization_id, recorded_dttm)
@@ -145,7 +143,6 @@ hosp_first_rass[, time_to_first_rass := as.numeric(difftime(first_rass_dttm, beg
 hosp_rass_clean <- hosp_first_rass[!is.na(time_to_first_rass) & time_to_first_rass <= 8]
 
 hosp_id_rass_clean <- unique(hosp_rass_clean$hospitalization_id)
-
 ```
 
 
@@ -153,7 +150,6 @@ hosp_id_rass_clean <- unique(hosp_rass_clean$hospitalization_id)
 # *** Calculate BMI
 # *** Filter out hospitalizations without BMI data
 ```{r}
-
 # STEP 1: Create weight / height vitals only table
 vitals_weight_height <- vitals[vital_category %in% c("weight_kg", "height_cm")][hospitalization_id %in% hosp_id_rass_clean]
 
@@ -166,6 +162,7 @@ vitals_weight_height <- dcast(vitals_weight_height,
                    fill = NA)  # Fill missing values with NA
 vitals_weight_height <- vitals_weight_height[, .(hospitalization_id, recorded_dttm, weight_kg, height_cm)]
 setorder(vitals_weight_height, hospitalization_id, recorded_dttm)
+
 
 # STEP 3: Filter Out improbably low weights and select first weight
 admission_weights <- vitals_weight_height[
@@ -199,7 +196,6 @@ hosp_id_vitals_clean <- unique(admission_bmi_final$hospitalization_id)
 # ***Clean part one data for only hospital ids that made it through cleaning in PART TWO and PART THREE
 # ***Establish timeline for each hospitalization_id around their IMV times
 ```{r}
-
 # STEP 1: Clean Part One Data so it only has hospitalization_ids identified after cleaning steps
 part_one_data_clean <- part_one_data[hospitalization_id %in% hosp_id_vitals_clean]
 
@@ -298,7 +294,6 @@ rass_percentages <- rass_hosp_final[, .(percent_deep_sedation = mean(percent_dee
 # PART SIX: Identify Paralyzed Patients
 # ***Identify all patients receiving continuous paralytics within the first 48 hours of mechanical ventilation
 ```{r}
-
 # STEP 1: Filter only for paralytic meds
 meds_paralytics <- meds[med_group == "paralytics"]
 
@@ -322,14 +317,12 @@ paralytic_clean[, paralyzed := as.logical(abs(difftime(earliest_paralytic_dttm, 
 # STEP 6: Fill Table Out and Choose Only hospitalization and paralytic data
 paralytic_clean[, paralyzed := fifelse(is.na(paralyzed) | paralyzed == "", FALSE, paralyzed)]
 paralytic_final <- paralytic_clean[, .(hospitalization_id, paralyzed)]
-
 ```
 
 
 # PART SEVEN: Determine primary sedation medication used
 # ***Identify the sedative infusion used for the majority of the first 48 hours of mechanical ventilation for each hospitalization_id
 ```{r}
-
 # STEP 1: Filter only for sedative meds
 meds_sedation <- meds[med_category %in% c("propofol", "dexmedetomidine", "ketamine", "midazolam", "pentobarbital", "lorazepam")][hospitalization_id %in% hosp_id_vitals_clean]
 
@@ -414,7 +407,6 @@ sedation_primary[is.na(primary_sedative), primary_sedative := "unknown"]
 
 
 sedative_table <- sedation_primary[, .(hospitalization_id, primary_sedative)]
-
 ```
 
 
@@ -466,8 +458,6 @@ primary_hospital[is.na(hospital_id), hospital_id := "Unknown"]
 
 
 hospital_id_final <- primary_hospital[, .(hospitalization_id, hospital_id)]
-
-
 ```
 
 
@@ -522,7 +512,6 @@ thirty_day_mortality[is.na(thirty_day_mortality) | thirty_day_mortality == "", t
 
 # STEP 7: Reduce down table
 thirty_day_mortality_final <- thirty_day_mortality[, .(hospitalization_id, thirty_day_mortality)]
-
 ```
 
 
