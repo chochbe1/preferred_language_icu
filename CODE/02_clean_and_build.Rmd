@@ -18,7 +18,7 @@ config <- yaml::read_yaml(here("config.yaml"))
 
 # Define directories based on YAML configuration
 data_dir <- config$data_dir
-output_dir <-  file.path(here(), "intermediate_data/")  # Define output_dir based on data_dir
+output_dir <-  file.path(here(), "intermediate_data//")  # Define output_dir based on data_dir
 file_type <- config$file_type
 institution <- config$institution
 
