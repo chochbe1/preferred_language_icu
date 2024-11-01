@@ -1,16 +1,6 @@
 
 # Setup Step: Setup libraries
 ```{r}
-packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr", "fst", "arrow", "table1", "lme4", "metafor", "yaml", "htmltools")
-install_if_missing <- function(package) {
-  if (!require(package, character.only = TRUE)) {
-    install.packages(package, dependencies = TRUE)
-    library(package, character.only = TRUE)
-  }
-}
-
-sapply(packages, install_if_missing)
-
 # Load necessary libraries
 library(data.table)
 library(dplyr)
@@ -23,8 +13,9 @@ library(table1)
 library(metafor)
 library(yaml)
 library(htmltools)
+library(here)
 
-config <- yaml::read_yaml("config.yaml")
+config <- yaml::read_yaml(here("config.yaml"))
 
 # Define directories based on YAML configuration
 data_dir <- config$data_dir
@@ -45,10 +36,9 @@ if (!dir.exists(output_dir)) {
 # Upload Part One Data Table
 part_two_data <- fread(paste0(intermediate_dir, "analytic_table.csv.gz"))
 
-
 # Identify reference points for model
 part_two_data$language <- relevel(as.factor(part_two_data$language), ref = "English")
-part_two_data$ethnicity <- relevel(as.factor(part_two_data$ethnicity), ref = "Non-Hispanic")
+part_two_data$ethnicity <- relevel(as.factor(part_two_data$ethnicity), ref = "Not Hispanic")
 part_two_data$race <- relevel(as.factor(part_two_data$race), ref = "White")
 part_two_data$sex <- relevel(as.factor(part_two_data$sex), ref = "Male")
 part_two_data$primary_sedative <- relevel(as.factor(part_two_data$primary_sedative), ref = "propofol")
@@ -90,8 +80,21 @@ primary_results_unadjusted <- data.frame(
 
 summary(primary_model_unadjusted)
 
+
 # Fit the adjusted primary model
-primary_model_adjusted <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + factor(hospital_id) + factor(primary_sedative), data = part_two_data)
+n_hospitals <- part_two_data$hospital_id %>% unique() %>% length()
+
+if (n_hospitals>1){
+  primary_model_adjusted <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + 
+                               race + bmi + paralyzed + total_sofa + 
+                               factor(hospital_id) + factor(primary_sedative), 
+                             data = part_two_data)
+} else {
+    primary_model_adjusted <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + 
+                               race + bmi + paralyzed + total_sofa + 
+                               factor(primary_sedative), 
+                             data = part_two_data)
+}
 
 summary(primary_model_adjusted)
 
@@ -118,10 +121,12 @@ fwrite(primary_results_combined, file = paste0(output_dir, institution, "_primar
 
 # PART THREE: Secondary Analysis
 ```{r}
-
 # Secondary Model of Total IMV Time
-secondary_model_imv_time <- lm(total_imv_time ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + factor(hospital_id), data = part_two_data)
-
+if (n_hospitals>1){
+  secondary_model_imv_time <- lm(total_imv_time ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + factor(hospital_id), data = part_two_data)
+} else {
+secondary_model_imv_time <- lm(total_imv_time ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa, data = part_two_data)
+}
 summary(secondary_model_imv_time)
 
 
@@ -141,9 +146,17 @@ fwrite(secondary_results_imv_time, file = paste0(output_dir, institution, "_seco
 
 
 # Secondary Model of 30-Day Mortality
-secondary_model_mortality <- glm(thirty_day_mortality ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + factor(hospital_id), 
+if (n_hospitals >1 ) {
+  secondary_model_mortality <- glm(thirty_day_mortality ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa + factor(hospital_id), 
                                   data = part_two_data, 
                                   family = binomial(link = "logit"))
+} else{
+  secondary_model_mortality <- glm(thirty_day_mortality ~ language + age + sex + ethnicity + race + bmi + paralyzed + total_sofa, 
+                                  data = part_two_data, 
+                                  family = binomial(link = "logit"))
+  
+}
+
 summary(secondary_model_mortality)
 
 # Extract coefficients and calculate odds ratios, standard errors, and variance
@@ -199,7 +212,12 @@ summary_table_hispanic <- table1(~ age + sex + race + bmi + paralyzed + total_so
 save_html(as.tags(summary_table_hispanic), file = paste0(output_dir, institution, "_hispanic_cohort_language_summary.html"))
 
 # Fit a linear model for Hispanic patients, excluding ethnicity
-model_hispanic <- lm(percent_deep_sedation ~ language + age + sex + race + bmi + paralyzed + total_sofa + factor(hospital_id) + factor(primary_sedative), data = hispanic_data)
+if (n_hospitals >1){
+  model_hispanic <- lm(percent_deep_sedation ~ language + age + sex + race + bmi + paralyzed + total_sofa + factor(hospital_id) + factor(primary_sedative), data = hispanic_data)
+} else{
+    model_hispanic <- lm(percent_deep_sedation ~ language + age + sex + race + bmi + paralyzed + total_sofa + factor(primary_sedative), data = hispanic_data)
+}
+
 summary(model_hispanic)
 results_hispanic <- extract_model_results(model_hispanic, "Hispanic")
 
@@ -208,7 +226,7 @@ results_hispanic <- extract_model_results(model_hispanic, "Hispanic")
 # BLACK/AFRICAN AMERICAN ANALYSIS
 black_data <- part_two_data[race == "Black or African American"]
 black_data$language <- relevel(as.factor(black_data$language), ref = "English")
-black_data$ethnicity <- relevel(as.factor(black_data$ethnicity), ref = "Non-Hispanic")
+black_data$ethnicity <- relevel(as.factor(black_data$ethnicity), ref = "Not Hispanic")
 black_data$sex <- relevel(as.factor(black_data$sex), ref = "Male")
 black_data$primary_sedative <- relevel(as.factor(black_data$primary_sedative), ref = "propofol")
 
@@ -219,7 +237,12 @@ summary_table_aa <- table1(~ age + sex + ethnicity + bmi + paralyzed + total_sof
 save_html(as.tags(summary_table_aa), file = paste0(output_dir, institution, "_aa_cohort_language_summary.html"))
 
 # Fit a linear model for Black patients, excluding race
-model_black <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + bmi + paralyzed + total_sofa + factor(hospital_id) + factor(primary_sedative), data = black_data)
+if (n_hospitals>1){
+  model_black <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + bmi + paralyzed + total_sofa + factor(hospital_id) + factor(primary_sedative), data = black_data)
+} else{
+    model_black <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + bmi + paralyzed + total_sofa + factor(primary_sedative), data = black_data)
+}
+
 summary(model_black)
 results_black <- extract_model_results(model_black, "Black or African American")
 
@@ -228,7 +251,7 @@ results_black <- extract_model_results(model_black, "Black or African American")
 # ASIAN ANALYSIS
 asian_data <- part_two_data[race == "Asian"]
 asian_data$language <- relevel(as.factor(asian_data$language), ref = "English")
-asian_data$ethnicity <- relevel(as.factor(asian_data$ethnicity), ref = "Non-Hispanic")
+asian_data$ethnicity <- relevel(as.factor(asian_data$ethnicity), ref = "Not Hispanic")
 asian_data$sex <- relevel(as.factor(asian_data$sex), ref = "Male")
 asian_data$primary_sedative <- relevel(as.factor(asian_data$primary_sedative), ref = "propofol")
 
@@ -239,7 +262,12 @@ summary_table_asian <- table1(~ age + sex + ethnicity + bmi + paralyzed + total_
 save_html(as.tags(summary_table_asian), file = paste0(output_dir, institution, "_asian_cohort_language_summary.html"))
 
 # Fit a linear model for Asian patients
-model_asian <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + bmi + paralyzed + total_sofa + factor(hospital_id) + factor(primary_sedative), data = asian_data)
+if (n_hospitals >1){
+  model_asian <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + bmi + paralyzed + total_sofa + factor(hospital_id) + factor(primary_sedative), data = asian_data)
+} else{
+    model_asian <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + bmi + paralyzed + total_sofa + factor(primary_sedative), data = asian_data)
+}
+
 summary(model_asian)
 results_asian <- extract_model_results(model_asian, "Asian")
 
@@ -248,7 +276,7 @@ results_asian <- extract_model_results(model_asian, "Asian")
 # WHITE ANALYSIS
 white_data <- part_two_data[race == "White"]
 white_data$language <- relevel(as.factor(white_data$language), ref = "English")
-white_data$ethnicity <- relevel(as.factor(white_data$ethnicity), ref = "Non-Hispanic")
+white_data$ethnicity <- relevel(as.factor(white_data$ethnicity), ref = "Not Hispanic")
 white_data$sex <- relevel(as.factor(white_data$sex), ref = "Male")
 white_data$primary_sedative <- relevel(as.factor(white_data$primary_sedative), ref = "propofol")
 
@@ -260,7 +288,12 @@ save_html(as.tags(summary_table_white), file = paste0(output_dir, institution, "
 
 
 # Fit a linear model for White patients
-model_white <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + bmi + paralyzed + total_sofa + factor(hospital_id) + factor(primary_sedative), data = white_data)
+if (n_hospitals>1){
+  model_white <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + bmi + paralyzed + total_sofa + factor(hospital_id) + factor(primary_sedative), data = white_data)
+} else{
+    model_white <- lm(percent_deep_sedation ~ language + age + sex + ethnicity + bmi + paralyzed + total_sofa + factor(primary_sedative), data = white_data)
+}
+
 summary(model_white)
 results_white <- extract_model_results(model_white, "White")
 

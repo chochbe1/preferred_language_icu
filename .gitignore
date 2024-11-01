@@ -2,6 +2,8 @@
 .DS_Store
 data/
 __pycache__/
+.Rprofile
+*.Rproj
 
 # Don' need log files (which could also contain PHI)
 log/

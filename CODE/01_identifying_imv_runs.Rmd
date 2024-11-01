@@ -1,18 +1,6 @@
 
 # Setup Step: Setup libraries
 ```{r}
-# Install Packages
-
-packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr", "fst", "arrow", "table1", "lme4", "metafor", "yaml")
-install_if_missing <- function(package) {
-  if (!require(package, character.only = TRUE)) {
-    install.packages(package, dependencies = TRUE)
-    library(package, character.only = TRUE)
-  }
-}
-
-sapply(packages, install_if_missing)
-
 # Load necessary libraries
 library(data.table)
 library(dplyr)
@@ -24,8 +12,9 @@ library(arrow)
 library(table1)
 library(metafor)
 library(yaml)
+library(here)
 
-config <- yaml::read_yaml("config.yaml")
+config <- yaml::read_yaml(here("config.yaml"))
 
 # Define directories based on YAML configuration
 data_dir <- config$data_dir
@@ -61,10 +50,13 @@ read_data <- function(file_path, select = NULL) {
 }
 
 # STEP 1: Load Raw CLIF Respiratory Support, Hospitalization, and Patient Tables
-respiratory_support <- as.data.table(read_data(paste0(data_dir, "clif_respiratory_support", file_type), select = c("hospitalization_id", "recorded_dttm", "device_category", "tracheostomy")))
-hospitalization <- as.data.table(read_data(paste0(data_dir, "clif_hospitalization", file_type), select = c("patient_id", "hospitalization_id", "admission_dttm", "discharge_dttm", "age_at_admission", "discharge_category")))
+respiratory_support <- as.data.table(read_data(file.path(data_dir, paste0("clif_respiratory_support", file_type)), 
+                                               select = c("hospitalization_id", "recorded_dttm", "device_category", "tracheostomy")))
+hospitalization <- as.data.table(read_data(file.path(data_dir, paste0("clif_hospitalization", file_type)), 
+                                           select = c("patient_id", "hospitalization_id", "admission_dttm", "discharge_dttm", "age_at_admission", "discharge_category")))
 hospitalization <- unique(hospitalization, by = "hospitalization_id")
-patient <- as.data.table(read_data(paste0(data_dir,"clif_patient", file_type), select = c("patient_id", "death_dttm")))
+patient <- as.data.table(read_data(file.path(data_dir, paste0("clif_patient", file_type)), 
+                                   select = c("patient_id", "death_dttm")))
 
 # STEP 2: Identifying the tracheostomy patients
 # Identify hospitalization_ids that have tracheostomy at some point during their hospitalization and earliest timestamp for this finding
