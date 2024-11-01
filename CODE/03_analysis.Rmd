@@ -38,7 +38,7 @@ part_two_data <- fread(paste0(intermediate_dir, "analytic_table.csv.gz"))
 
 # Identify reference points for model
 part_two_data$language <- relevel(as.factor(part_two_data$language), ref = "English")
-part_two_data$ethnicity <- relevel(as.factor(part_two_data$ethnicity), ref = "Not Hispanic")
+part_two_data$ethnicity <- relevel(as.factor(part_two_data$ethnicity), ref = "Non-Hispanic")
 part_two_data$race <- relevel(as.factor(part_two_data$race), ref = "White")
 part_two_data$sex <- relevel(as.factor(part_two_data$sex), ref = "Male")
 part_two_data$primary_sedative <- relevel(as.factor(part_two_data$primary_sedative), ref = "propofol")
@@ -226,7 +226,7 @@ results_hispanic <- extract_model_results(model_hispanic, "Hispanic")
 # BLACK/AFRICAN AMERICAN ANALYSIS
 black_data <- part_two_data[race == "Black or African American"]
 black_data$language <- relevel(as.factor(black_data$language), ref = "English")
-black_data$ethnicity <- relevel(as.factor(black_data$ethnicity), ref = "Not Hispanic")
+black_data$ethnicity <- relevel(as.factor(black_data$ethnicity), ref = "Non-Hispanic")
 black_data$sex <- relevel(as.factor(black_data$sex), ref = "Male")
 black_data$primary_sedative <- relevel(as.factor(black_data$primary_sedative), ref = "propofol")
 
@@ -251,7 +251,7 @@ results_black <- extract_model_results(model_black, "Black or African American")
 # ASIAN ANALYSIS
 asian_data <- part_two_data[race == "Asian"]
 asian_data$language <- relevel(as.factor(asian_data$language), ref = "English")
-asian_data$ethnicity <- relevel(as.factor(asian_data$ethnicity), ref = "Not Hispanic")
+asian_data$ethnicity <- relevel(as.factor(asian_data$ethnicity), ref = "Non-Hispanic")
 asian_data$sex <- relevel(as.factor(asian_data$sex), ref = "Male")
 asian_data$primary_sedative <- relevel(as.factor(asian_data$primary_sedative), ref = "propofol")
 
@@ -276,7 +276,7 @@ results_asian <- extract_model_results(model_asian, "Asian")
 # WHITE ANALYSIS
 white_data <- part_two_data[race == "White"]
 white_data$language <- relevel(as.factor(white_data$language), ref = "English")
-white_data$ethnicity <- relevel(as.factor(white_data$ethnicity), ref = "Not Hispanic")
+white_data$ethnicity <- relevel(as.factor(white_data$ethnicity), ref = "Non-Hispanic")
 white_data$sex <- relevel(as.factor(white_data$sex), ref = "Male")
 white_data$primary_sedative <- relevel(as.factor(white_data$primary_sedative), ref = "propofol")
 
