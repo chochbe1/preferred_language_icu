@@ -1,18 +1,6 @@
 
 # Setup Step: Setup libraries
 ```{r}
-# Install Packages
-
-packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr", "fst", "arrow", "table1", "lme4", "metafor", "yaml")
-install_if_missing <- function(package) {
-  if (!require(package, character.only = TRUE)) {
-    install.packages(package, dependencies = TRUE)
-    library(package, character.only = TRUE)
-  }
-}
-
-sapply(packages, install_if_missing)
-
 # Load necessary libraries
 library(data.table)
 library(dplyr)
@@ -24,8 +12,9 @@ library(arrow)
 library(table1)
 library(metafor)
 library(yaml)
+library(here)
 
-config <- yaml::read_yaml("config.yaml")
+config <- yaml::read_yaml(here("config.yaml"))
 
 # Define directories based on YAML configuration
 data_dir <- config$data_dir
@@ -61,27 +50,31 @@ read_data <- function(file_path, select = NULL) {
 }
 
 # Upload Part One Data Table
-part_one_data <- fread(paste0(output_dir, "imv_runs.csv.gz"))
+part_one_data <- fread(file.path(output_dir, "imv_runs.csv.gz"))
 part_one_hosp_id <- unique(part_one_data$hospitalization_id)
 
 # STEP 1: Load Patient Assessments For Hospitalization_IDs above
 specific_assessment_categories <- c("RASS", "gcs_total")
-patient_assessments <- as.data.table(read_data(paste0(data_dir, "clif_patient_assessments", file_type), 
-                             select = c("hospitalization_id", "recorded_dttm", "assessment_category", "numerical_value")))[hospitalization_id %in% part_one_hosp_id & assessment_category %in% specific_assessment_categories]
+patient_assessments <- as.data.table(read_data(file.path(data_dir, paste0("clif_patient_assessments", file_type)), 
+                             select = c("hospitalization_id", "recorded_dttm", "assessment_category", "numerical_value")))[
+                               hospitalization_id %in% part_one_hosp_id & assessment_category %in% specific_assessment_categories]
 
 
 # STEP 2: Upload CLIF Vitals 
 specific_vital_categories <- c("sbp", "dbp", "height_cm", "weight_kg")
-vitals <- as.data.table(read_data(paste0(data_dir, "clif_vitals", file_type), 
+vitals <- as.data.table(read_data(file.path(data_dir, paste0("clif_vitals", file_type)), 
   select = c("hospitalization_id", "recorded_dttm", "vital_category", "vital_value"))
 )[hospitalization_id %in% part_one_hosp_id & vital_category %in% specific_vital_categories]
+
 
 
 # STEP 3: Upload CLIF Labs
 # Labs Table Conversion to recorded_dttm
 # Using Lab Collect DTTM as the marker instead of order or result
 specific_lab_categories <- c("creatinine", "bilirubin_total", "platelet_count", "po2_arterial")
-labs <- as.data.table(read_data(paste0(data_dir,"clif_labs", file_type), select = c("hospitalization_id", "lab_collect_dttm", "lab_category", "lab_value_numeric")))[hospitalization_id %in% part_one_hosp_id & lab_category %in% specific_lab_categories]
+labs <- as.data.table(read_data(file.path(data_dir, paste0("clif_labs", file_type)), 
+                                select = c("hospitalization_id", "lab_collect_dttm", "lab_category", "lab_value_numeric")))[
+  hospitalization_id %in% part_one_hosp_id & lab_category %in% specific_lab_categories]
 setorder(labs, hospitalization_id, lab_collect_dttm)
 setnames(labs, "lab_collect_dttm", "recorded_dttm")
 labs[, recorded_dttm := as.POSIXct(recorded_dttm, origin = "1970-01-01")]
@@ -89,25 +82,25 @@ labs[, recorded_dttm := as.POSIXct(recorded_dttm, origin = "1970-01-01")]
 
 # STEP 4: Upload CLIF Continuous Meds
 # Upload CLIF Continuous Meds
-meds <- as.data.table(read_data(paste0(data_dir,"clif_medication_admin_continuous", file_type), select = c("hospitalization_id", "admin_dttm", "med_dose", "med_dose_unit", "med_category", "med_group")))[hospitalization_id %in% part_one_hosp_id]
+meds <- as.data.table(read_data(file.path(data_dir,paste0("clif_medication_admin_continuous", file_type)), select = c("hospitalization_id", "admin_dttm", "med_dose", "med_dose_unit", "med_category", "med_group")))[hospitalization_id %in% part_one_hosp_id]
 
 
 # STEP 5: Upload CLIF ADT Table
-adt <- as.data.table(read_data(paste0(data_dir,"clif_adt", file_type), select = c("hospitalization_id", "hospital_id", "in_dttm", "out_dttm")))[hospitalization_id %in% part_one_hosp_id]
+adt <- as.data.table(read_data(file.path(data_dir,paste0("clif_adt", file_type)), select = c("hospitalization_id", "hospital_id", "in_dttm", "out_dttm")))[hospitalization_id %in% part_one_hosp_id]
 
 
 # STEP 6: Upload CLIF Hospitalization Table
-hospitalization <- as.data.table(read_data(paste0(data_dir, "clif_hospitalization", file_type), select = c("patient_id", "hospitalization_id", "admission_dttm", "age_at_admission")))[hospitalization_id %in% part_one_hosp_id]
+hospitalization <- as.data.table(read_data(file.path(data_dir,paste0( "clif_hospitalization", file_type)), select = c("patient_id", "hospitalization_id", "admission_dttm", "age_at_admission")))[hospitalization_id %in% part_one_hosp_id]
 hospitalization <- unique(hospitalization, by = "hospitalization_id")
 pat_imv_part_two <- unique(hospitalization$patient_id)
 
 
 # STEP 7: Upload CLIF Patient Table
-patient <- as.data.table(read_data(paste0(data_dir,"clif_patient", file_type), select = c("patient_id", "sex_category", "race_category", "ethnicity_category", "language_name", "death_dttm")))[patient_id %in% pat_imv_part_two]
+patient <- as.data.table(read_data(file.path(data_dir,paste0("clif_patient", file_type)), select = c("patient_id", "sex_category", "race_category", "ethnicity_category", "language_name", "death_dttm")))[patient_id %in% pat_imv_part_two]
 
 
 # STEP 8: Upload CLIF Respiratory Support
-respiratory_support <- as.data.table(read_data(paste0(data_dir, "clif_respiratory_support", file_type), select = c("hospitalization_id", "recorded_dttm", "fio2_set")))[hospitalization_id %in% part_one_hosp_id]
+respiratory_support <- as.data.table(read_data(file.path(data_dir,paste0( "clif_respiratory_support", file_type)), select = c("hospitalization_id", "recorded_dttm", "fio2_set")))[hospitalization_id %in% part_one_hosp_id]
 ```
 
 
@@ -119,6 +112,11 @@ respiratory_support <- as.data.table(read_data(paste0(data_dir, "clif_respirator
 pat_assess_rass <- patient_assessments[assessment_category == "RASS"]
 setorder(pat_assess_rass, hospitalization_id, recorded_dttm)
 
+part_one_data <- part_one_data %>%
+  mutate(hospitalization_id = as.character(hospitalization_id))
+
+pat_assess_rass <- pat_assess_rass %>%
+  mutate(hospitalization_id = as.character(hospitalization_id))
 
 # STEP 2: Merge part_one_data with RASS
 hosp_time_rass <- merge(part_one_data, pat_assess_rass, by = "hospitalization_id", all = TRUE)
@@ -143,6 +141,8 @@ hosp_first_rass[, time_to_first_rass := as.numeric(difftime(first_rass_dttm, beg
 hosp_rass_clean <- hosp_first_rass[!is.na(time_to_first_rass) & time_to_first_rass <= 8]
 
 hosp_id_rass_clean <- unique(hosp_rass_clean$hospitalization_id)
+
+patient_assessments %>% count(assessment_category)
 ```
 
 
@@ -150,6 +150,7 @@ hosp_id_rass_clean <- unique(hosp_rass_clean$hospitalization_id)
 # *** Calculate BMI
 # *** Filter out hospitalizations without BMI data
 ```{r}
+
 # STEP 1: Create weight / height vitals only table
 vitals_weight_height <- vitals[vital_category %in% c("weight_kg", "height_cm")][hospitalization_id %in% hosp_id_rass_clean]
 
